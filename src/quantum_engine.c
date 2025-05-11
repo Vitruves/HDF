@@ -2,8 +2,6 @@
 #include "globals.h"
 #include "utils.h"   // Added for PI and potentially other utils
 #include <math.h>    // For sqrt, exp, cos, acos, atan2, fabs, fmod, pow
-#include <string.h>  // For strcmp
-#include <stdlib.h>  // For abs
 
 #ifdef __GNUC__
 #define UNUSED __attribute__((unused))
@@ -226,31 +224,47 @@ void apply_quantum_corrections_to_atoms() {
 }
 
 double calculate_atom_phase_qm(AtomPos atom, int idx) {
-    double base_phase = (atom.atomic_number % 18) * PI / 18.0; // Group in periodic table (approx)
+    double base_phase = fmod((atom.atomic_number * PI / 18.0) + (atom.isotope * PI / 90.0), 2.0 * PI); // Base on period and isotope
     
-    double nuclear_effect = (atom.effective_nuclear_charge / 20.0) * PI; // Max Z_eff around 20 for heavy elements?
-    nuclear_effect = fmod(nuclear_effect, 2.0 * PI);
+    // Effective nuclear charge and electronegativity influence
+    double charge_density_effect = (atom.effective_nuclear_charge / (atom.radius + 1e-6)) * PI / 50.0; 
+    double en_effect = atom.electronegativity * PI / 20.0;
 
+    // Orbital contributions with more distinction
     double orbital_effect = 0.0;
-    // s, p, d, f electrons: 0, 1, 2, 3
-    orbital_effect += atom.orbital_config[0] * 0.05 * PI; // s-electrons
-    orbital_effect += atom.orbital_config[1] * 0.10 * PI; // p-electrons
-    orbital_effect += atom.orbital_config[2] * 0.15 * PI; // d-electrons
-    orbital_effect += atom.orbital_config[3] * 0.20 * PI; // f-electrons
-    orbital_effect = fmod(orbital_effect, 2.0 * PI);
+    orbital_effect += atom.orbital_config[0] * 0.05 * PI; // s-electrons (valence)
+    orbital_effect += atom.orbital_config[1] * 0.12 * PI; // p-electrons (valence)
+    orbital_effect += atom.orbital_config[2] * 0.18 * PI; // d-electrons (if applicable)
+    orbital_effect += atom.orbital_config[3] * 0.22 * PI; // f-electrons (if applicable)
 
-    double hybrid_effect = (atom.hybridization / 3.0) * PI * 0.25; // sp, sp2, sp3 -> 0 to max effect
+    // Hybridization effect (more pronounced)
+    double hybrid_effect = 0.0;
+    if (atom.hybridization == 1) hybrid_effect = 0.1 * PI; // sp
+    else if (atom.hybridization == 2) hybrid_effect = 0.2 * PI; // sp2
+    else if (atom.hybridization == 3) hybrid_effect = 0.15 * PI; // sp3 (less phase shift than sp2 for some models)
     
-    unsigned int hash = hash_string(atom.atom, idx);
-    double position_salt = (hash % 1000) / 1000.0 * PI / 8.0; // Smaller random component
-    
-    double charge_effect = atom.charge * PI / 4.0; // Larger effect for charge
-    
-    double aromatic_shift = atom.is_aromatic ? PI / 12.0 : 0.0; // Smaller distinct shift
+    // Polarizability approximation (proportional to volume ~ radius^3)
+    double polarizability_approx = pow(atom.radius, 3.0);
+    double polarizability_effect = fmod(polarizability_approx * PI / 10.0, 2.0 * PI);
 
-    double total_phase = base_phase + nuclear_effect + orbital_effect + 
-                         hybrid_effect + position_salt + charge_effect + aromatic_shift;
+    // Reduced position salt for less randomness, more deterministic physics
+    unsigned int hash = hash_string(atom.atom, idx + atom.atomic_number); // Salt with atomic number too
+    double position_salt = (hash % 100) / 1000.0 * PI; // Smaller range, e.g., 0 to 0.1 PI
     
+    double charge_effect = atom.charge * PI / 3.0; // Stronger charge effect
+    
+    double aromatic_shift = atom.is_aromatic ? 0.25 * PI : 0.0; // More distinct aromatic shift
+    double ring_strain_effect = atom.in_ring ? 0.05 * PI * atom.n_bonds : 0.0; // Simple ring effect based on connectivity
+
+    double total_phase = base_phase + charge_density_effect + en_effect + orbital_effect + 
+                         hybrid_effect + polarizability_effect + position_salt + charge_effect + 
+                         aromatic_shift + ring_strain_effect;
+    
+    // Phase contribution from Z-coordinate (pseudo depth cue)
+    // Modulate based on how far from z=0, non-linearly
+    double z_phase_contribution = atan(atom.z * 0.5) * 0.1 * PI; // arctan for bounded effect
+    total_phase += z_phase_contribution;
+
     return fmod(total_phase, 2.0 * PI);
 }
 
@@ -258,31 +272,67 @@ double calculate_bond_phase_qm(BondSeg bond) {
     AtomPos atom_a = atoms[bond.a];
     AtomPos atom_b = atoms[bond.b];
     
-    double order_phase = bond.order * PI / 6.0; // Bond order effect
-    
+    // Bond order effect - more distinct steps
+    double order_phase = 0.0;
+    if (bond.order == 1) order_phase = 0.1 * PI;
+    else if (bond.order == 2) order_phase = 0.3 * PI;
+    else if (bond.order == 3) order_phase = 0.5 * PI;
+    else order_phase = 0.05 * PI; // Fractional or other orders
+
+    // Electronegativity difference (polarity) - non-linear response
     double en_diff = fabs(atom_a.electronegativity - atom_b.electronegativity);
-    double polarity_effect = en_diff * PI / 10.0; // Electronegativity difference (polarity)
+    double polarity_effect = pow(en_diff / 4.0, 2.0) * 0.4 * PI; // Max EN diff is ~4.0
     
+    // Resonance and aromaticity effect
     double resonance_effect = 0.0;
     if (bond.type == BOND_AROMATIC) {
-        resonance_effect = PI / 8.0; // Special phase for aromatic bonds (delocalization)
+        resonance_effect = 0.35 * PI; // Stronger phase for aromatic bonds
+    } else if (atom_a.is_aromatic && atom_b.is_aromatic) {
+        resonance_effect = 0.15 * PI; // Both atoms aromatic, bond itself might not be marked but is part of system
     }
     
-    double ring_effect = bond.in_ring ? PI / 12.0 : 0.0; // Strain/conjugation in rings
-    
-    // Average Z_eff of bonded atoms
+    // Ring effects (strain and conjugation within rings)
+    double ring_effect = 0.0;
+    if (bond.in_ring) {
+        // Could be more complex based on ring size, but a simple shift for now
+        ring_effect = 0.1 * PI;
+        if (bond.type == BOND_AROMATIC) ring_effect *= 1.5; // Enhance for aromatic rings
+    }
+        
+    // Effect of average effective nuclear charge of bonded atoms
     double avg_Z_eff = (atom_a.effective_nuclear_charge + atom_b.effective_nuclear_charge) / 2.0;
-    double avg_energy_effect = (avg_Z_eff / 20.0) * PI / 8.0;
-    
-    // Average hybridization
-    double avg_hybrid = (atom_a.hybridization + atom_b.hybridization) / 2.0;
-    double hybrid_overlap_effect = (avg_hybrid / 3.0) * PI / 10.0;
+    double avg_energy_effect = fmod((avg_Z_eff / 10.0) * PI / 4.0, 2.0 * PI);
 
-    // TODO: Consider bond length directly if it's physically meaningful and not just for drawing
-    // double length_effect = (bond.length - 1.5) * PI / 20.0; // Assuming 1.5A is a reference
+    // Hybridization overlap effect - more specific contributions
+    double hybrid_overlap_effect = 0.0;
+    double h1 = atom_a.hybridization; // sp=1, sp2=2, sp3=3
+    double h2 = atom_b.hybridization;
+    // Sigma bonds base overlap
+    if (h1 > 0 && h2 > 0) { // Both hybridized
+        hybrid_overlap_effect = ( (4.0-h1) + (4.0-h2) ) / 6.0 * 0.15 * PI; // Higher s-character (lower h number) = better overlap phase shift
+    }
+    // Pi-bond contributions if applicable (sp2-sp2, sp-sp, sp-sp2)
+    if ((h1 == 2 && h2 == 2 && bond.order >=2) || 
+        (h1 == 1 && h2 == 1 && bond.order >=2) || 
+        (((h1 == 1 && h2 == 2) || (h1 == 2 && h2 == 1)) && bond.order >=2)) {
+        hybrid_overlap_effect += (bond.order -1) * 0.1 * PI; // Additional shift for pi bonds
+    }
+
+    // Bond length deviation from ideal (based on radii and order)
+    double ideal_length = atom_a.radius + atom_b.radius;
+    if (bond.order == 2) ideal_length *= 0.85; else if (bond.order == 3) ideal_length *= 0.75;
+    if (bond.type == BOND_AROMATIC) ideal_length *= 0.92; // Slightly different factor for aromatic
+    double length_deviation = bond.length - ideal_length;
+    double length_effect = atan(length_deviation * 5.0) * 0.15 * PI; // arctan for bounded, sensitive effect
+
+    // Interaction term: polarizability of atoms and bond polarity
+    double avg_polarizability_a = pow(atom_a.radius, 3.0);
+    double avg_polarizability_b = pow(atom_b.radius, 3.0);
+    double polarizability_interaction_effect = (avg_polarizability_a + avg_polarizability_b)/2.0 * en_diff * PI / 50.0;
 
     double total_phase = order_phase + polarity_effect + resonance_effect + 
-                         ring_effect + avg_energy_effect + hybrid_overlap_effect;
+                         ring_effect + avg_energy_effect + hybrid_overlap_effect + 
+                         length_effect + polarizability_interaction_effect;
                          
     return fmod(total_phase, 2.0 * PI);
 }

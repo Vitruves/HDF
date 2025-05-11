@@ -1,3 +1,27 @@
+// Simplify CUDA handling
+#if defined(HAS_CUDA) || defined(__CUDACC__)
+// Use real CUDA headers
+#include <cuda_runtime.h>
+#include <cuComplex.h>
+#else
+// Define minimal CUDA types when not using real CUDA
+typedef enum {
+    cudaSuccess = 0
+} cudaError_t;
+#define cudaFree(ptr) (cudaSuccess)
+
+#ifndef CUDA_COMPLEX_DEFINED
+typedef struct { double x, y; } cuDoubleComplex;
+static cuDoubleComplex make_cuDoubleComplex(double x, double y) {
+    cuDoubleComplex z;
+    z.x = x;
+    z.y = y;
+    return z;
+}
+#define CUDA_COMPLEX_DEFINED
+#endif
+#endif
+
 #include "diffraction_engine.h"
 #include "globals.h" // Access to atoms, bonds, atom_count, bond_count
 #include "quantum_engine.h" // For QM calculations if use_quantum_model is true
@@ -7,6 +31,40 @@
 #include <string.h>
 #include <math.h>    // For sqrt, cos, sin, exp, ceil, fabs, atan2, fmod, cbrt
 #include <fftw3.h>   // FFTW3 library for efficient FFT
+
+// Include this after we've handled the CUDA types
+#include "diffraction_engine_cuda.h"
+
+// Add this variable to track if CUDA is available
+static int cuda_available = -1; // -1: not checked, 0: not available, 1: available
+
+// Function to check CUDA availability (declared in diffraction_engine_cuda.h)
+extern int cuda_check_available(void);
+
+// Wrapper for checking CUDA availability
+static int check_cuda_available() {
+    // If CPU is forced, return 0
+    if (use_cuda == 0) {
+        printf("CPU mode selected. Using CPU implementation.\n");
+        return 0;
+    }
+
+    if (cuda_available == -1) {
+        // Try to initialize CUDA
+        cuda_available = cuda_check_available();
+        
+        if (cuda_available) {
+            printf("CUDA accelerated layout optimization enabled (batch size: %d)\n", cuda_batch_size);
+        } else {
+            if (use_cuda == 2) {  // CUDA was forced
+                fprintf(stderr, "Error: CUDA was forced but is not available.\n");
+                exit(1);
+            }
+            printf("CUDA not available, using CPU implementation\n");
+        }
+    }
+    return cuda_available;
+}
 
 // Classical phase calculation (simpler model if QM is off)
 static double calculate_atom_phase_classical(AtomPos atom, int idx) {
@@ -46,6 +104,13 @@ static double calculate_bond_phase_classical(BondSeg bond) {
 
 
 void optimize_molecule_layout(int iterations, double k_spring, double k_repulsive, double damping_factor, double time_step_factor) {
+    // Try to use CUDA if available
+    if (check_cuda_available()) {
+        optimize_molecule_layout_cuda(iterations, k_spring, k_repulsive, damping_factor, time_step_factor);
+        return;
+    }
+    
+    // Original CPU implementation if CUDA is not available
     if (atom_count == 0) return;
 
     double *forces_x = calloc(atom_count, sizeof(double));
@@ -165,7 +230,16 @@ void optimize_molecule_layout(int iterations, double k_spring, double k_repulsiv
     }
 }
 
+// Define conversion functions for cuDoubleComplex <-> complex double
+static complex double cuDoubleComplex_to_complex(cuDoubleComplex z) {
+    return z.x + z.y * I;
+}
 
+static cuDoubleComplex complex_to_cuDoubleComplex(complex double z) {
+    return make_cuDoubleComplex(creal(z), cimag(z));
+}
+
+// Modify draw_atom_on_grid and draw_bond_on_grid to use CUDA when available
 void draw_atom_on_grid(complex double *aperture_grid, int grid_width, AtomPos atom, int atom_idx, bool use_quantum_model) {
     double phase = use_quantum_model ? 
         calculate_atom_phase_qm(atom, atom_idx) : 
@@ -240,7 +314,6 @@ void draw_atom_on_grid(complex double *aperture_grid, int grid_width, AtomPos at
         }
     }
 }
-
 
 void draw_bond_on_grid(complex double *aperture_grid, int grid_width, BondSeg bond, bool use_quantum_model) {
     AtomPos atom_A = atoms[bond.a];
@@ -337,6 +410,140 @@ void draw_bond_on_grid(complex double *aperture_grid, int grid_width, BondSeg bo
     }
 }
 
+// Add a new function that uses CUDA for drawing molecules
+void draw_molecule_on_grid(complex double *aperture_grid, int grid_width, bool use_quantum_model) {
+    if (check_cuda_available() && !use_quantum_model) {
+        // Use CUDA implementation for classical model
+        cuDoubleComplex *cu_aperture_grid = malloc(grid_width * grid_width * sizeof(cuDoubleComplex));
+        if (!cu_aperture_grid) {
+            fprintf(stderr, "Error: Failed to allocate memory for CUDA aperture grid\n");
+            return;
+        }
+        
+        // Initialize aperture grid
+        for (int i = 0; i < grid_width * grid_width; i++) {
+            cu_aperture_grid[i] = complex_to_cuDoubleComplex(aperture_grid[i]);
+        }
+        
+        // Call CUDA implementation
+        draw_molecule_on_grid_cuda(cu_aperture_grid, grid_width, atoms, atom_count, bonds, bond_count);
+        
+        // Copy back results
+        for (int i = 0; i < grid_width * grid_width; i++) {
+            aperture_grid[i] = cuDoubleComplex_to_complex(cu_aperture_grid[i]);
+        }
+        
+        free(cu_aperture_grid);
+    } else {
+        // Use CPU implementation
+        for (int i = 0; i < atom_count; ++i) {
+            draw_atom_on_grid(aperture_grid, grid_width, atoms[i], i, use_quantum_model);
+        }
+        for (int i = 0; i < bond_count; ++i) {
+            draw_bond_on_grid(aperture_grid, grid_width, bonds[i], use_quantum_model);
+        }
+    }
+}
+
+// Modify fft_2d to use CUDA when available
+void fft_2d(complex double *data, int width, int height, int direction) {
+    if (check_cuda_available() && direction == 1) { // Forward FFT
+        // Use CUDA implementation for forward FFT and intensity calculation
+        cuDoubleComplex *cu_data = malloc(width * height * sizeof(cuDoubleComplex));
+        double *intensity = malloc(width * height * sizeof(double));
+        
+        if (!cu_data || !intensity) {
+            fprintf(stderr, "Error: Failed to allocate memory for CUDA FFT\n");
+            if (cu_data) free(cu_data);
+            if (intensity) free(intensity);
+            return;
+        }
+        
+        // Initialize data
+        for (int i = 0; i < width * height; i++) {
+            cu_data[i] = complex_to_cuDoubleComplex(data[i]);
+        }
+        
+        // Call CUDA implementation
+        compute_diffraction_pattern_cuda(cu_data, intensity, width);
+        
+        // Convert intensity back to complex format
+        for (int i = 0; i < width * height; i++) {
+            data[i] = sqrt(intensity[i]); // Just put magnitude in real part
+        }
+        
+        free(cu_data);
+        free(intensity);
+        
+        // Apply fftshift
+        fft_shift_2d(data, width, height);
+    } else {
+        // Use existing FFTW implementation
+        fftw_complex *fftw_data = (fftw_complex*)data;
+        fftw_plan plan = fftw_plan_dft_2d(width, height, fftw_data, fftw_data, 
+                                          direction == 1 ? FFTW_FORWARD : FFTW_BACKWARD, 
+                                          FFTW_ESTIMATE);
+        fftw_execute(plan);
+        fftw_destroy_plan(plan);
+
+        // Normalize if it's an inverse FFT
+        if (direction == -1) {
+            for (int i = 0; i < width * height; i++) {
+                data[i] /= (width * height);
+            }
+        }
+        // Apply fftshift if it is a forward FFT and not handled by CUDA part
+        if (direction == 1) {
+            fft_shift_2d(data, width, height);
+        }
+    }
+}
+
+// Add the definition for fft_shift_2d here
+void fft_shift_2d(complex double *data, int width, int height) {
+    int half_width = width / 2;
+    int half_height = height / 2;
+
+    complex double *temp_quad = (complex double*)malloc(half_width * half_height * sizeof(complex double));
+    if (!temp_quad) {
+        fprintf(stderr, "Error: Failed to allocate memory for fft_shift_2d temp buffer.\n");
+        return;
+    }
+
+    // Swap quadrants
+    // Quadrant 1 (top-left) with Quadrant 3 (bottom-right)
+    for (int r = 0; r < half_height; ++r) {
+        for (int c = 0; c < half_width; ++c) {
+            temp_quad[r * half_width + c] = data[r * width + c]; // Store Q1
+            data[r * width + c] = data[(r + half_height) * width + (c + half_width)]; // Move Q3 to Q1
+            data[(r + half_height) * width + (c + half_width)] = temp_quad[r * half_width + c]; // Move stored Q1 to Q3
+        }
+    }
+
+    // Quadrant 2 (top-right) with Quadrant 4 (bottom-left)
+    for (int r = 0; r < half_height; ++r) {
+        for (int c = 0; c < half_width; ++c) {
+            temp_quad[r * half_width + c] = data[r * width + (c + half_width)]; // Store Q2
+            data[r * width + (c + half_width)] = data[(r + half_height) * width + c]; // Move Q4 to Q2
+            data[(r + half_height) * width + c] = temp_quad[r * half_width + c]; // Move stored Q2 to Q4
+        }
+    }
+    free(temp_quad);
+}
+
+// Add a new function for log scaling with CUDA
+void apply_log_scale_intensity_cuda(double *intensity, double *scaled_intensity, 
+                                  int width, int height, double max_intensity, double epsilon) {
+    if (check_cuda_available()) {
+        apply_log_scale_cuda(intensity, scaled_intensity, width, epsilon);
+    } else {
+        // CPU implementation
+        for (int i = 0; i < width * height; i++) {
+            double ratio = intensity[i] / max_intensity;
+            scaled_intensity[i] = log10(ratio + epsilon) / log10(1.0 + epsilon);
+        }
+    }
+}
 
 void add_molecular_orbital_effects(complex double *aperture_grid, int grid_width) {
     if (atom_count == 0) return;
@@ -441,102 +648,6 @@ void add_molecular_orbital_effects(complex double *aperture_grid, int grid_width
     free(conjugated_system_map);
 }
 
-
-// Replace the existing FFT implementation with FFTW version
-void fft_2d(complex double *data, int width, int height, int direction) {
-    // The simplest approach - FFTW complex is just a double[2]
-    double (*fftw_in)[2] = (double (*)[2])fftw_malloc(width * height * sizeof(double[2]));
-    double (*fftw_out)[2] = (double (*)[2])fftw_malloc(width * height * sizeof(double[2]));
-    
-    if (!fftw_in || !fftw_out) {
-        fprintf(stderr, "Error: Failed to allocate FFTW buffer\n");
-        if (fftw_in) fftw_free(fftw_in);
-        if (fftw_out) fftw_free(fftw_out);
-        return;
-    }
-    
-    // Copy data using array notation
-    for (int i = 0; i < width * height; i++) {
-        fftw_in[i][0] = creal(data[i]);
-        fftw_in[i][1] = cimag(data[i]);
-    }
-    
-    // Create plan
-    fftw_plan plan = fftw_plan_dft_2d(height, width, 
-                                     (fftw_complex*)fftw_in, 
-                                     (fftw_complex*)fftw_out, 
-                                     direction == 1 ? FFTW_FORWARD : FFTW_BACKWARD, 
-                                     FFTW_ESTIMATE);
-    
-    if (!plan) {
-        fprintf(stderr, "Error: Failed to create FFTW plan\n");
-        fftw_free(fftw_in);
-        fftw_free(fftw_out);
-        return;
-    }
-    
-    // Execute the transform
-    fftw_execute(plan);
-    
-    // Copy results back
-    for (int i = 0; i < width * height; i++) {
-        data[i] = fftw_out[i][0] + I * fftw_out[i][1];
-    }
-    
-    // If inverse FFT, normalize manually
-    if (direction == -1) {
-        double scale = 1.0 / (width * height);
-        for (int i = 0; i < width * height; i++) {
-            data[i] *= scale;
-        }
-    }
-    
-    // Apply fftshift for forward transform
-    if (direction == 1) {
-        fft_shift_2d(data, width, height);
-    }
-    
-    // Clean up FFTW resources
-    fftw_destroy_plan(plan);
-    fftw_free(fftw_in);
-    fftw_free(fftw_out);
-}
-
-void fft_shift_2d(complex double *data, int width, int height) {
-    complex double *temp_row = malloc(width * sizeof(complex double));
-    if (!temp_row) {fprintf(stderr, "FFT shift row alloc failed\n"); return; }
-
-    int half_width = width / 2;
-    int half_height = height / 2;
-
-    // Shift rows
-    for (int y = 0; y < height; y++) {
-        complex double *p = data + y * width;
-        memcpy(temp_row, p + half_width, (width - half_width) * sizeof(complex double));
-        memcpy(temp_row + (width - half_width), p, half_width * sizeof(complex double));
-        memcpy(p, temp_row, width * sizeof(complex double));
-    }
-    free(temp_row);
-
-    complex double *temp_col = malloc(height * sizeof(complex double));
-     if (!temp_col) {fprintf(stderr, "FFT shift col alloc failed\n"); return; }
-    // Shift columns
-    for (int x = 0; x < width; x++) {
-        for(int y=0; y<height; ++y) temp_col[y] = data[y*width+x]; // Extract column
-
-        complex double *p_col_shifted = malloc(height * sizeof(complex double));
-        if (!p_col_shifted) { free(temp_col); fprintf(stderr, "FFT shift col work alloc failed\n"); return; }
-
-
-        memcpy(p_col_shifted, temp_col + half_height, (height-half_height)*sizeof(complex double));
-        memcpy(p_col_shifted + (height-half_height), temp_col, half_height*sizeof(complex double));
-        
-        for(int y=0; y<height; ++y) data[y*width+x] = p_col_shifted[y]; // Put back shifted column
-        free(p_col_shifted);
-    }
-    free(temp_col);
-}
-
 void condense_fingerprint_average(const double *input_fp, int input_w, int input_h, int block_size, double *output_fp, int *output_w, int *output_h) {
     if (block_size <= 1) { // No condensation or invalid block_size
         *output_w = input_w;
@@ -568,5 +679,56 @@ void condense_fingerprint_average(const double *input_fp, int input_w, int input
                 output_fp[oy * (*output_w) + ox] = 0.0; // Should not happen with perfect division
             }
         }
+    }
+}
+
+void optimize_molecule_layout_batch(
+    AtomPos **atoms_batch_ptr_array,
+    int *atom_counts_batch,
+    BondSeg **bonds_batch_ptr_array,
+    int *bond_counts_batch,
+    int num_molecules_in_batch,
+    int iterations, double k_spring, double k_repulsive,
+    double damping_factor, double time_step_factor
+) {
+    if (check_cuda_available()) { // check_cuda_available internally checks global use_cuda and actual device presence
+        // Call the batched CUDA function declared in diffraction_engine_cuda.h
+        optimize_molecule_layout_cuda_batched(
+            atoms_batch_ptr_array, atom_counts_batch,
+            bonds_batch_ptr_array, bond_counts_batch,
+            num_molecules_in_batch, iterations, k_spring, k_repulsive,
+            damping_factor, time_step_factor
+        );
+    } else {
+        // CPU Batch processing:
+        // The existing optimize_molecule_layout function contains the CPU logic
+        // and operates on the global `atoms`, `bonds`, `atom_count`, `bond_count`.
+        // We need to temporarily set these globals for each molecule in the batch.
+
+        // Save original global pointers and counts
+        AtomPos* original_global_atoms_ptr = atoms;
+        BondSeg* original_global_bonds_ptr = bonds;
+        int original_global_atom_count = atom_count;
+        int original_global_bond_count = bond_count;
+
+        for (int i = 0; i < num_molecules_in_batch; ++i) {
+            // Set globals for the current molecule
+            atoms = atoms_batch_ptr_array[i]; // atoms_batch_ptr_array[i] should point to the actual data
+            atom_count = atom_counts_batch[i];
+            bonds = bonds_batch_ptr_array[i]; // bonds_batch_ptr_array[i] should point to the actual data
+            bond_count = bond_counts_batch[i];
+
+            // Call the existing single-molecule optimize_molecule_layout.
+            // Since check_cuda_available() returned false, this will execute its CPU path.
+            optimize_molecule_layout(iterations, k_spring, k_repulsive, damping_factor, time_step_factor);
+            // The results are written directly into the memory pointed to by atoms_batch_ptr_array[i]
+            // because the global `atoms` was pointing to it.
+        }
+
+        // Restore original global pointers and counts
+        atoms = original_global_atoms_ptr;
+        bonds = original_global_bonds_ptr;
+        atom_count = original_global_atom_count;
+        bond_count = original_global_bond_count;
     }
 }

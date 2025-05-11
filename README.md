@@ -1,6 +1,6 @@
-# hdf_plus: Holographic Diffraction Fingerprints Generator
+# hdf: Holographic Diffraction Fingerprints Generator
 
-`hdf_plus` is a command-line application written in C that processes SMILES (Simplified Molecular Input Line Entry System) strings from a CSV file to generate holographic diffraction fingerprints. It can optionally render and save images of the simulated diffraction patterns.
+`hdf` is a command-line application written in C that processes SMILES (Simplified Molecular Input Line Entry System) strings from a CSV file to generate holographic diffraction fingerprints. It can optionally render and save images of the simulated diffraction patterns.
 
 The core process involves:
 1.  Parsing SMILES strings to understand molecular structure.
@@ -35,7 +35,7 @@ The core process involves:
 
 ## Prerequisites (Ubuntu)
 
-To build and run `hdf_plus` on Ubuntu, you will need the following:
+To build and run `hdf` on Ubuntu, you will need the following:
 
 *   **C Compiler:** `gcc` (GNU Compiler Collection) or `clang`.
 *   **Make:** The `make` utility.
@@ -58,14 +58,14 @@ sudo apt install build-essential libfftw3-dev
 1.  **Clone the repository (if applicable):**
     ```bash
     # git clone <your-repo-url>
-    # cd hdf_plus
+    # cd hdf
     ```
 
 2.  **Compile the project using the Makefile:**
     ```bash
     make
     ```
-    This will create an executable named `hdf_plus` in the project's root directory.
+    This will create an executable named `hdf` in the project's root directory.
 
 3.  **Clean build files:**
     ```bash
@@ -77,13 +77,13 @@ sudo apt install build-essential libfftw3-dev
 The basic command to run the program is:
 
 ```bash
-./hdf_plus -i <input_file.csv> -o <output_file.csv> [options]
+./hdf -i <input_file.csv> -o <output_file.csv> [options]
 ```
 
 **Example:**
 
 ```bash
-./hdf_plus -i data/input_molecules.csv -o results/fingerprints.csv --output-dir results/images -r 1024 -j 4 --verbose
+./hdf -i data/input_molecules.csv -o results/fingerprints.csv --output-dir results/images -r 1024 -j 4 --verbose
 ```
 
 This command will:
@@ -99,7 +99,7 @@ This command will:
 For a full list of available command-line options and their descriptions, run:
 
 ```bash
-./hdf_plus --help
+./hdf --help
 ```
 
 Key options include:

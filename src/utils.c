@@ -1,5 +1,4 @@
 #include "utils.h"
-#include <string.h> // For strlen in hash_string if used, or *str++
 
 double clamp_double(double value, double min, double max) {
     if (value < min) return min;

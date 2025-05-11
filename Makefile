@@ -1,5 +1,6 @@
 # Compiler: Default to gcc, can be overridden e.g., make CC=clang
 CC = gcc
+NVCC = nvcc
 
 # Base CFLAGS (applied to all builds)
 # -std=gnu11: GNU C11 standard (supports C11 atomics and GNU extensions)
@@ -9,15 +10,20 @@ CC = gcc
 # -g: Include debugging symbols
 # -ffast-math: Aggressive floating point optimizations (can sometimes reduce precision)
 # -march=native: Optimize for the current machine's architecture (less portable binary)
-BASE_CFLAGS = -std=gnu11 -O3 -Wall -Wextra -Iinclude -g -ffast-math -march=native
+# -fPIC: Position independent code
+BASE_CFLAGS = -std=gnu11 -O3 -Wall -Wextra -Iinclude -g -ffast-math -march=native -fPIC
 
 # Base LDFLAGS (applied to all builds)
 # -lm: Link math library
-BASE_LDFLAGS = -lm
+# -lfftw3: Link FFTW3 library
+BASE_LDFLAGS = -lm -lfftw3
 
 # Initialize CFLAGS and LDFLAGS with base values
 CFLAGS = $(BASE_CFLAGS)
 LDFLAGS = $(BASE_LDFLAGS)
+
+# CUDA flags
+CUDAFLAGS = -O3 -arch=sm_60 -Xcompiler -fPIC
 
 # Detect OS
 UNAME_S := $(shell uname -s)
@@ -75,34 +81,53 @@ else # Linux (and other Unix-like systems)
     endif
 endif
 
+# Add these lines to the Makefile to find CUDA libraries
+CUDA_PATH ?= /usr/local/cuda
+CUDA_INCLUDE_PATH ?= $(CUDA_PATH)/include
+CUDA_LIBRARY_PATH ?= $(CUDA_PATH)/lib64
+
+# Update CFLAGS to include CUDA headers
+CFLAGS += -I$(CUDA_INCLUDE_PATH)
+
+# Update LDFLAGS to include CUDA library path and cuFFT
+LDFLAGS += -L$(CUDA_LIBRARY_PATH) -lcudart -lcufft
+
+# Conditionally include CUDA
+HAS_CUDA := $(shell which nvcc 2>/dev/null)
+ifdef HAS_CUDA
+    CFLAGS += -DHAS_CUDA
+    LDFLAGS += -lcufft
+else
+    $(warning "CUDA not found, building with CPU-only implementation")
+endif
+
 # Directories
 SRC_DIR = src
 OBJ_DIR = obj
+INC_DIR = include
 
 # Source files
-SRCS = $(SRC_DIR)/cli.c \
-       $(SRC_DIR)/diffraction_engine.c \
-       $(SRC_DIR)/globals.c \
-       $(SRC_DIR)/quantum_engine.c \
-       $(SRC_DIR)/render_engine.c \
-       $(SRC_DIR)/smiles_parser.c \
-       $(SRC_DIR)/utils.c
-
-# Object files
-OBJS = $(SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
+C_SRCS = $(wildcard $(SRC_DIR)/*.c)
+CUDA_SRCS = $(wildcard $(SRC_DIR)/*.cu)
+C_OBJS = $(C_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
+CUDA_OBJS = $(CUDA_SRCS:$(SRC_DIR)/%.cu=$(OBJ_DIR)/%.o)
+OBJS = $(C_OBJS) $(CUDA_OBJS)
 
 # Target executable
-EXEC = hdf_plus
+EXEC = hdf
 
 .PHONY: all clean install uninstall debug profile compile_commands help test depend export-compile-cmd
 
 all: $(EXEC)
 
 $(EXEC): $(OBJS)
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) # Use $^ for all prerequisites (OBJS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) -lcudart
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR) # Add $(OBJ_DIR) as an order-only prerequisite
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -I$(INC_DIR) -c $< -o $@
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu
+	$(NVCC) $(CUDAFLAGS) -I$(INC_DIR) -c $< -o $@
 
 $(OBJ_DIR):
 	@mkdir -p $(OBJ_DIR)
@@ -139,7 +164,7 @@ compile_commands:
 	@echo "[" > compile_commands.json
 	@printf "Generating compile_commands.json...\\n"
 	@first=true; \
-	for src_file in $(SRCS); do \
+	for src_file in $(C_SRCS) $(CUDA_SRCS); do \
 		obj_file=$(OBJ_DIR)/$$(basename $$src_file .c).o; \
 		if [ "$$first" = false ]; then printf ",\\n" >> compile_commands.json; fi; \
 		printf "  {\n" >> compile_commands.json; \
@@ -156,7 +181,7 @@ compile_commands:
 depend:
 	@echo "Generating dependencies into Makefile.deps..."
 	@rm -f Makefile.deps
-	@for src in $(SRCS); do \
+	@for src in $(C_SRCS) $(CUDA_SRCS); do \
 		$(CC) -MM $(CFLAGS) $$src | sed 's|^\(.*\)\.o:|$(OBJ_DIR)/\1.o:|' >> Makefile.deps; \
 	done
 	@echo "Dependencies generated."
@@ -170,7 +195,7 @@ export-compile-cmd:
 	@echo "" >> compile_commands.sh
 	@echo "mkdir -p $(OBJ_DIR)" >> compile_commands.sh
 	@echo "" >> compile_commands.sh
-	@for src in $(SRCS); do \
+	@for src in $(C_SRCS) $(CUDA_SRCS); do \
 		echo "# Compile $$(basename $$src)" >> compile_commands.sh; \
 		echo "$(CC) $(CFLAGS) -c $$src -o $(OBJ_DIR)/$$(basename $$src .c).o" >> compile_commands.sh; \
 		echo "" >> compile_commands.sh; \

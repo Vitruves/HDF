@@ -89,10 +89,29 @@ static ParserConfig parser_config = {
 };
 
 void initialize_molecule_data() {
+    // Allocate memory for atoms and bonds if they haven't been allocated yet
+    if (atoms == NULL) {
+        atoms = (AtomPos*)malloc(MAX_ATOMS * sizeof(AtomPos));
+        if (atoms == NULL) {
+            fprintf(stderr, "Critical Error: Failed to allocate memory for global atoms array in initialize_molecule_data.\n");
+            // Potentially add more robust error handling or exit
+            exit(EXIT_FAILURE);
+        }
+    }
+    if (bonds == NULL) {
+        bonds = (BondSeg*)malloc(MAX_BONDS * sizeof(BondSeg));
+        if (bonds == NULL) {
+            fprintf(stderr, "Critical Error: Failed to allocate memory for global bonds array in initialize_molecule_data.\n");
+            if (atoms) free(atoms); // Clean up atoms if bonds allocation failed
+            atoms = NULL;
+            exit(EXIT_FAILURE);
+        }
+    }
+
     atom_count = 0;
     bond_count = 0;
-    memset(atoms, 0, sizeof(atoms));
-    memset(bonds, 0, sizeof(bonds));
+    memset(atoms, 0, MAX_ATOMS * sizeof(AtomPos));
+    memset(bonds, 0, MAX_BONDS * sizeof(BondSeg));
     for (int i = 0; i < 10; ++i) {
         rings[i].idx = -1;
         rings[i].pair_idx = -1;
@@ -112,8 +131,8 @@ AtomProperties get_atom_properties(const char* symbol) {
 void set_atom_initial_properties(AtomPos *atom, const AtomProperties *props) {
     atom->atomic_number = props->atomic_number;
     atom->electronegativity = props->electronegativity;
-    atom->radius = props->covalent_radius;
-    atom->valence = props->valence_electrons;
+    atom->radius = props->radius;
+    atom->valence = props->valence;
     atom->effective_nuclear_charge = props->effective_nuclear_charge;
     memcpy(atom->orbital_config, props->orbital_config, sizeof(props->orbital_config));
     

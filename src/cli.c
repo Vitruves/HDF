@@ -1,3 +1,4 @@
+#define _GNU_SOURCE 
 #include "cli.h"
 #include "globals.h"
 #include "molecule.h"
@@ -20,8 +21,8 @@
 #include <time.h>
 #include <stdbool.h>
 #ifdef __linux__
-    #define _GNU_SOURCE
     #include <sched.h>
+    #include <sys/types.h>
 #endif
 
 #ifdef _OPENMP
@@ -32,21 +33,37 @@
 #define omp_get_max_threads() 1
 #endif
 
-#define MAX_CSV_LINE_LENGTH 2048
+#define MAX_CSV_LINE_LENGTH 16384
 #define MAX_CSV_COLUMNS 128
-#define MAX_FINGERPRINT_STR_LEN (4096 * 4096 * 8)
+#define MAX_FINGERPRINT_STR_LEN (1024 * 1024)
 #define BATCH_SIZE 50
 #define CSV_BUFFER_SIZE (1024 * 1024)
+
+// Structure to hold data for a single parsed molecule
+typedef struct {
+    AtomPos *atoms_data;         // Dynamically allocated array of atoms
+    BondSeg *bonds_data;         // Dynamically allocated array of bonds
+    int num_atoms;
+    int num_bonds;
+    char original_smiles[MAX_CSV_LINE_LENGTH];
+    char original_line_for_output[MAX_CSV_LINE_LENGTH];
+    int original_row_idx;        // 1-indexed for user display
+    bool complex_feature_warning;
+    // Any other per-molecule data needed by worker threads after layout can be added here
+} ParsedMoleculeData;
 
 pthread_mutex_t global_processing_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;
 atomic_int total_processed_count = 0;
 
 // Global flag for graceful shutdown
-static volatile sig_atomic_t keep_running = 1;
+volatile sig_atomic_t keep_running = 1;
 
 // Global start time
 static time_t start_time;
+
+// Global processing variables
+ParsedMoleculeData *parsed_molecules = NULL; // Array to hold parsed molecule data
 
 // Signal handler
 static void signal_handler(int signum) {
@@ -66,39 +83,31 @@ static int get_cpu_count() {
     #endif
 }
 
-// Set thread affinity
-static void set_thread_affinity(int thread_id) {
-    #if defined(__linux__) && defined(_OPENMP)
-        int cpu_count = get_cpu_count();
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(thread_id % cpu_count, &cpuset);
-        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-    #elif defined(__APPLE__) && defined(_OPENMP)
-        // macOS doesn't support CPU affinity in the same way
-        // Could use thread_policy_set() but it's not recommended
-        (void)thread_id; // Suppress unused parameter warning
-    #else
-        (void)thread_id; // Suppress unused parameter warning
-    #endif
-}
-
+// Thread worker for parallel CSV processing
 typedef struct {
     int thread_id;
     CliArgs *args;
+    int status;  // 0 = idle, 1 = processing, 2 = done-success, -1 = error, -2 = invalid molecule
+    bool has_new_task;
+    bool please_exit;
+    
+    // Input
     char smiles_to_process[MAX_CSV_LINE_LENGTH];
     char original_line_for_output[MAX_CSV_LINE_LENGTH];
     int original_row_idx;
     
+    // Whether to use pre-parsed molecule data
+    bool use_parsed_molecule;
+    int parsed_molecule_idx;
+    
+    // Output
     char *result_fingerprint;
     char *full_output_line;
     
-    int status; // 0=idle, 1=processing, 2=done(clean), -1=error(hard), -2=done(warning)
+    // Thread synchronization
     pthread_mutex_t mutex;
     pthread_cond_t condition_task;
     pthread_cond_t condition_done;
-    bool has_new_task;
-    bool please_exit;
 } WorkerThread;
 
 typedef struct {
@@ -126,7 +135,7 @@ int init_csv_processor(CsvProcessor *processor, const char *input_path, const ch
 char* read_csv_line(CsvProcessor *processor);
 int get_line_count(const char *file_path);
 int process_csv_streaming(CliArgs *args);
-int process_csv_parallel(CliArgs *args, int num_threads);
+int process_csv_parallel(CliArgs *args);
 
 // Function declarations for external functions
 extern void initialize_molecule_data(void);
@@ -134,6 +143,15 @@ extern int parse_smiles(const char *smiles, bool *complex_feature_warning);
 extern void apply_quantum_corrections_to_atoms(void);
 extern void optimize_molecule_layout(int iterations, double k_spring, double k_repulsive, 
                                    double damping, double time_step);
+extern void optimize_molecule_layout_batch(
+    AtomPos **atoms_batch_ptr_array,
+    int *atom_counts_batch,
+    BondSeg **bonds_batch_ptr_array,
+    int *bond_counts_batch,
+    int num_molecules_in_batch,
+    int iterations, double k_spring, double k_repulsive,
+    double damping_factor, double time_step_factor
+);
 extern void draw_atom_on_grid(complex double *aperture_grid, int grid_width, 
                             AtomPos atom, int atom_idx, bool use_quantum_model);
 extern void draw_bond_on_grid(complex double *aperture_grid, int grid_width, 
@@ -146,262 +164,257 @@ extern void output_diffraction_image(FILE *fp, double *intensity, int width, int
                                    bool color, const char *format);
 
 // Add these external variable declarations
+extern AtomPos *atoms;
+extern BondSeg *bonds;
 extern int atom_count;
-extern AtomPos atoms[MAX_ATOMS];
 extern int bond_count;
-extern BondSeg bonds[MAX_ATOMS * 2];
 
 // Function prototype for condensation, if not already in diffraction_engine.h include
 extern void condense_fingerprint_average(const double *input_fp, int input_w, int input_h, int block_size, double *output_fp, int *output_w, int *output_h);
 
-void* process_molecule_thread(void *arg) {
-    WorkerThread *worker = (WorkerThread*)arg;
-    CliArgs *args = worker->args;
+// Forward declarations for new helper functions
+static double* generate_diffraction_for_molecule_cli(CliArgs *args, int *fp_width_out, int *fp_height_out, double *max_intensity_out);
+static void format_fingerprint_for_csv_cli(CliArgs *args, const char* smiles, const char* original_line, 
+                                      int fp_width, int fp_height, const double* fingerprint_data, 
+                                      char* fingerprint_str_out, int max_fp_str_len, 
+                                      char* full_output_line_out, int max_full_line_len, 
+                                      double max_intensity);
+static void save_diffraction_image_for_molecule_cli(CliArgs *args, const char* smiles, int original_row_idx,
+                                               const double* fingerprint_data, int fp_width, int fp_height);
 
-    // Set thread affinity
-    set_thread_affinity(worker->thread_id);
-
-    int W = args->resolution;
-    int total_grid_points = W * W;
-    complex double *aperture_grid = calloc(total_grid_points, sizeof(complex double));
-    double *intensity = malloc(total_grid_points * sizeof(double));
+// Thread function for parallel molecule processing
+void *process_molecule_thread(void *arg) {
+    WorkerThread *worker = (WorkerThread *)arg;
     
-    if (!aperture_grid || !intensity) {
+    while (1) {
+        // Wait for a new task
         pthread_mutex_lock(&worker->mutex);
-        worker->status = -1;
-        worker->has_new_task = false;
-        pthread_mutex_unlock(&worker->mutex);
-        if (aperture_grid) free(aperture_grid);
-        if (intensity) free(intensity);
-        return NULL;
-    }
-
-    while (keep_running) {  // Check global flag for graceful shutdown
-        pthread_mutex_lock(&worker->mutex);
-        while (!worker->has_new_task && !worker->please_exit && keep_running) {
+        while (!worker->has_new_task && !worker->please_exit) {
             pthread_cond_wait(&worker->condition_task, &worker->mutex);
         }
-
-        if (!keep_running || worker->please_exit) {
-            worker->status = 0;
+        
+        if (worker->please_exit) {
             pthread_mutex_unlock(&worker->mutex);
             break;
         }
-
-        worker->status = 1;
-        char current_smiles[MAX_CSV_LINE_LENGTH];
-        char current_original_line[MAX_CSV_LINE_LENGTH];
-        int current_row_idx = worker->original_row_idx;
-        strcpy(current_smiles, worker->smiles_to_process);
-        strcpy(current_original_line, worker->original_line_for_output);
         
+        worker->status = 1; // processing
         worker->has_new_task = false;
         pthread_mutex_unlock(&worker->mutex);
-
-        int parsed_atom_count_result = 0;
-        bool complex_feature_warning = false;
-
-        pthread_mutex_lock(&global_processing_mutex);
-        initialize_molecule_data();
-        parsed_atom_count_result = parse_smiles(current_smiles, &complex_feature_warning);
-        int num_parsed_atoms = parsed_atom_count_result;
-
-        if (complex_feature_warning) {
+        
+        CliArgs *args = worker->args;
+        int row_idx = worker->original_row_idx;
+        extern AtomPos *atoms;     // Use global atoms
+        extern BondSeg *bonds;     // Use global bonds
+        extern int atom_count;
+        extern int bond_count;
+        extern ParsedMoleculeData *parsed_molecules; // Access parsed molecule data
+        
+        if (args->verbose) {
             pthread_mutex_lock(&output_mutex);
-            fprintf(stderr, "\nNote: SMILES '%s' (row %d) contained complex features ([...]) or unclosed rings that were skipped/partially handled.\n", current_smiles, current_row_idx);
-            fflush(stderr);
+            printf("\nThread %d: Processing SMILES (row %d): %s\n", 
+                   worker->thread_id, row_idx, worker->smiles_to_process);
             pthread_mutex_unlock(&output_mutex);
         }
-
-        if (num_parsed_atoms > 0) {
-            if (args->use_quantum_model || args->use_mo_effects) {
-                apply_quantum_corrections_to_atoms();
+        
+        // Reset globals (important if pre-parsed molecule isn't used)
+        initialize_molecule_data();
+        
+        // This flag tracks whether the molecule was processed successfully
+        bool success = false;
+        
+        // Use the pre-parsed molecule data if available
+        if (worker->use_parsed_molecule) {
+            success = true;
+            
+            // Temporarily update globals to point to our pre-processed molecule data
+            atom_count = parsed_molecules[worker->parsed_molecule_idx].num_atoms;
+            bond_count = parsed_molecules[worker->parsed_molecule_idx].num_bonds;
+            atoms = parsed_molecules[worker->parsed_molecule_idx].atoms_data;
+            bonds = parsed_molecules[worker->parsed_molecule_idx].bonds_data;
+        } else {
+            // Parse SMILES (this will use and update globals)
+            bool complex_feature_warning = false;
+            int parsed_atom_count = parse_smiles(worker->smiles_to_process, &complex_feature_warning);
+            
+            if (parsed_atom_count > 0) {
+                // Applies to the global atoms/bonds
+                success = true;
+                
+                if (args->use_quantum_model || args->use_mo_effects) {
+                    apply_quantum_corrections_to_atoms();
+                }
+                
+                // Optimize layout
+                optimize_molecule_layout(
+                    args->layout_iterations,
+                    args->k_spring,
+                    args->k_repulsive,
+                    args->damping_factor,
+                    args->time_step_factor
+                );
             }
-
-            optimize_molecule_layout(args->layout_iterations, args->k_spring, args->k_repulsive, args->damping_factor, args->time_step_factor);
-
-            memset(aperture_grid, 0, total_grid_points * sizeof(complex double));
-
-            for (int i = 0; i < atom_count; ++i) {
+        }
+        
+        if (success) {
+            // Generate diffraction pattern using the existing process_molecule function
+            // which uses the global arrays
+            int W = args->resolution;
+            int total_grid_points = W * W;
+            complex double *aperture_grid = calloc(total_grid_points, sizeof(complex double));
+            double *intensity = malloc(total_grid_points * sizeof(double));
+            
+            if (!aperture_grid || !intensity) {
+                pthread_mutex_lock(&output_mutex);
+                fprintf(stderr, "\nError: Worker %d failed to allocate memory for grid arrays\n", worker->thread_id);
+                pthread_mutex_unlock(&output_mutex);
+                
+                if (aperture_grid) free(aperture_grid);
+                if (intensity) free(intensity);
+                
+                worker->status = -1; // error
+                continue;
+            }
+            
+            // Draw atoms and bonds on grid
+            for (int i = 0; i < atom_count; i++) {
                 draw_atom_on_grid(aperture_grid, W, atoms[i], i, args->use_quantum_model);
             }
-            for (int i = 0; i < bond_count; ++i) {
+            
+            for (int i = 0; i < bond_count; i++) {
                 draw_bond_on_grid(aperture_grid, W, bonds[i], args->use_quantum_model);
             }
-
+            
             if (args->use_mo_effects) {
                 add_molecular_orbital_effects(aperture_grid, W);
             }
-
+            
+            // Calculate diffraction pattern
             fft_2d(aperture_grid, W, W, 1);
-
-            double max_raw_intensity = 0.0;
-            for (int i = 0; i < total_grid_points; ++i) {
+            
+            // Calculate intensity
+            double max_intensity = 0.0;
+            for (int i = 0; i < total_grid_points; i++) {
                 intensity[i] = cabs(aperture_grid[i]) * cabs(aperture_grid[i]);
-                if(intensity[i] > max_raw_intensity) max_raw_intensity = intensity[i];
+                if (intensity[i] > max_intensity) max_intensity = intensity[i];
             }
             
-            double epsilon_log_fp = max_raw_intensity * 1e-7;
-            if(epsilon_log_fp < 1e-10) epsilon_log_fp = 1e-10;
-
-            // Buffer for log-scaled intensity values
-            double *scaled_intensity_buffer = malloc(total_grid_points * sizeof(double));
-            if (!scaled_intensity_buffer) {
-                pthread_mutex_lock(&output_mutex);
-                fprintf(stderr, "\nError: Worker %d failed to alloc scaled_intensity_buffer for SMILES '%s'\n", worker->thread_id, current_smiles);
-                pthread_mutex_unlock(&output_mutex);
-                // Set error status and cleanup (simplified here)
-                pthread_mutex_unlock(&global_processing_mutex);
-                pthread_mutex_lock(&worker->mutex);
-                worker->status = -1;
-                pthread_mutex_unlock(&worker->mutex);
-                if(aperture_grid) free(aperture_grid);
-                if(intensity) free(intensity);
-                return NULL; // Critical error
-            }
-
-            for(int i = 0; i < total_grid_points; ++i) {
-                scaled_intensity_buffer[i] = apply_log_scale_intensity(intensity[i], max_raw_intensity, epsilon_log_fp);
-            }
+            // Apply log scaling
+            double epsilon = max_intensity * 1.0e-7;
+            if (epsilon < 1.0e-10) epsilon = 1.0e-10;
             
-            double *fingerprint_data_to_write = NULL;
-            int num_fp_values_to_write = 0;
-
-            if (args->condense_block_size > 1) {
-                int condensed_w, condensed_h;
-                double *condensed_buffer = malloc((W / args->condense_block_size) * (W / args->condense_block_size) * sizeof(double));
-                if (!condensed_buffer) {
-                     pthread_mutex_lock(&output_mutex);
-                     fprintf(stderr, "\nError: Worker %d failed to alloc condensed_buffer for SMILES '%s'\n", worker->thread_id, current_smiles);
-                     pthread_mutex_unlock(&output_mutex);
-                     free(scaled_intensity_buffer);
-                     // Set error status and cleanup (similar to above)
-                    pthread_mutex_unlock(&global_processing_mutex);
-                    pthread_mutex_lock(&worker->mutex);
-                    worker->status = -1;
-                    pthread_mutex_unlock(&worker->mutex);
-                    if(aperture_grid) free(aperture_grid);
-                    if(intensity) free(intensity);
-                    return NULL;
-                }
-                condense_fingerprint_average(scaled_intensity_buffer, W, W, args->condense_block_size, condensed_buffer, &condensed_w, &condensed_h);
-                free(scaled_intensity_buffer);
-                scaled_intensity_buffer = NULL;
-                fingerprint_data_to_write = condensed_buffer;
-                num_fp_values_to_write = condensed_w * condensed_h;
-            } else {
-                fingerprint_data_to_write = scaled_intensity_buffer;
-                num_fp_values_to_write = total_grid_points;
-            }
-
-            worker->result_fingerprint[0] = '\0';
-            char temp_val_str[32];
-            for (int i = 0; i < num_fp_values_to_write; ++i) {
-                sprintf(temp_val_str, "%.4f", fingerprint_data_to_write[i]);
-                strcat(worker->result_fingerprint, temp_val_str);
-                if (i < num_fp_values_to_write - 1) {
-                    strcat(worker->result_fingerprint, " ");
-                }
-                if (strlen(worker->result_fingerprint) >= MAX_FINGERPRINT_STR_LEN - 32) {
-                    pthread_mutex_lock(&output_mutex);
-                    fprintf(stderr, "\nWarning: Fingerprint string truncated for SMILES '%s' (row %d) due to length.\n", current_smiles, current_row_idx);
-                    pthread_mutex_unlock(&output_mutex);
-                    break;
-                }
-            }
-
-            // Prepare full output line
+            // Generate output line
             if (args->column_format) {
-                worker->full_output_line[0] = '\0'; 
-                strcat(worker->full_output_line, current_original_line); 
+                worker->full_output_line[0] = '\0';
+                strcat(worker->full_output_line, worker->original_line_for_output);
                 
-                char temp_fp_val_str[32];
-                for (int i = 0; i < num_fp_values_to_write; ++i) {
-                    sprintf(temp_fp_val_str, ",%.4f", fingerprint_data_to_write[i]);
-                    strcat(worker->full_output_line, temp_fp_val_str);
-                    
-                    if (strlen(worker->full_output_line) >= MAX_CSV_LINE_LENGTH + MAX_FINGERPRINT_STR_LEN - 32) {
-                        pthread_mutex_lock(&output_mutex);
-                        fprintf(stderr, "\nWarning: Fingerprint columns truncated for SMILES '%s' (row %d) due to length.\n", 
-                                current_smiles, current_row_idx);
-                        pthread_mutex_unlock(&output_mutex);
+                // Use a more efficient approach for building the string - direct writes instead of strcat
+                int offset = strlen(worker->full_output_line);
+                int remaining = MAX_CSV_LINE_LENGTH + MAX_FINGERPRINT_STR_LEN - offset - 1;
+                char *ptr = worker->full_output_line + offset;
+                
+                // For column format, add one value per column
+                for (int i = 0; i < total_grid_points && remaining > 10; i++) {
+                    double scaled_value = apply_log_scale_intensity(intensity[i], max_intensity, epsilon);
+                    int written = snprintf(ptr, remaining, ",%.4f", scaled_value);
+                    if (written < 0 || written >= remaining) {
+                        // Won't fit, stop here
                         break;
                     }
+                    ptr += written;
+                    remaining -= written;
                 }
             } else {
-                // Space-separated format
-                worker->result_fingerprint[0] = '\0';
-                 char temp_fp_val_str[32];
-                for (int i = 0; i < num_fp_values_to_write; ++i) {
-                    sprintf(temp_fp_val_str, "%.4f", fingerprint_data_to_write[i]);
-                    strcat(worker->result_fingerprint, temp_fp_val_str);
-                    if (i < num_fp_values_to_write - 1) {
-                        strcat(worker->result_fingerprint, " ");
+                // For row format, use fixed width for each value to calculate if it will fit
+                int est_chars_per_value = 8; // Approx ",0.1234" or ",12.34" length
+                int max_values = (MAX_CSV_LINE_LENGTH + MAX_FINGERPRINT_STR_LEN - 
+                                 strlen(worker->original_line_for_output) - 32) / est_chars_per_value;
+                
+                if (max_values < total_grid_points) {
+                    // Will truncate, so use a condensed format - only include every Nth point
+                    int stride = (total_grid_points + max_values - 1) / max_values;
+                    
+                    // Copy header first
+                    snprintf(worker->full_output_line, MAX_CSV_LINE_LENGTH + MAX_FINGERPRINT_STR_LEN,
+                            "%s,", worker->original_line_for_output);
+                    
+                    // Append values with stride
+                    char *ptr = worker->full_output_line + strlen(worker->full_output_line);
+                    int remaining = MAX_CSV_LINE_LENGTH + MAX_FINGERPRINT_STR_LEN - strlen(worker->full_output_line) - 1;
+                    
+                    for (int i = 0; i < total_grid_points; i += stride) {
+                        double scaled_value = apply_log_scale_intensity(intensity[i], max_intensity, epsilon);
+                        int written;
+                        if (i > 0) {
+                            written = snprintf(ptr, remaining, " %.4f", scaled_value);
+                        } else {
+                            written = snprintf(ptr, remaining, "%.4f", scaled_value);
+                        }
+                        
+                        if (written < 0 || written >= remaining) break;
+                        
+                        ptr += written;
+                        remaining -= written;
                     }
-                    if (strlen(worker->result_fingerprint) >= MAX_FINGERPRINT_STR_LEN - 32) {
+                    
+                    if (stride > 1) {
                         pthread_mutex_lock(&output_mutex);
-                        fprintf(stderr, "\nWarning: Fingerprint string truncated for SMILES '%s' (row %d) due to length.\n", current_smiles, current_row_idx);
-                        pthread_mutex_unlock(&output_mutex);
-                        break;
-                    }
-                }
-                snprintf(worker->full_output_line, MAX_CSV_LINE_LENGTH + MAX_FINGERPRINT_STR_LEN + 1,
-                         "%s,%s", current_original_line, worker->result_fingerprint);
-            }
-            
-            // Free the buffer that holds the final fingerprint data
-            if (fingerprint_data_to_write) {
-                free(fingerprint_data_to_write);
-                fingerprint_data_to_write = NULL;
-            }
-
-            if (!args->no_images && args->output_dir_images) {
-                char image_filename[512];
-                char sanitized_smiles[64];
-                strncpy(sanitized_smiles, current_smiles, 60);
-                sanitized_smiles[60] = '\0';
-                for(char *p_san = sanitized_smiles; *p_san; ++p_san) {
-                    if (!isalnum(*p_san) && *p_san != '_' && *p_san != '-') *p_san = '_';
-                }
-                sprintf(image_filename, "%s/smi_r%d_%s.%s", args->output_dir_images, current_row_idx, sanitized_smiles, args->output_format_images);
-                FILE *img_file = fopen(image_filename, "wb");
-                if (img_file) {
-                    bool is_color = (strcmp(args->output_format_images, "ppm") == 0);
-                    output_diffraction_image(img_file, intensity, W, W, is_color, args->output_format_images);
-                    fclose(img_file);
-                    if(args->verbose){
-                        pthread_mutex_lock(&output_mutex);
-                        printf("\nSaved image: %s (Worker %d)\n", image_filename, worker->thread_id);
+                        fprintf(stderr, "\nNote: Fingerprint for row %d condensed by factor of %d due to size constraints\n", 
+                                row_idx, stride);
                         pthread_mutex_unlock(&output_mutex);
                     }
                 } else {
-                    pthread_mutex_lock(&output_mutex);
-                    fprintf(stderr, "\nWarning: Worker %d could not open file to save image: %s for SMILES %s (row %d)\n", worker->thread_id, image_filename, current_smiles, current_row_idx);
-                    pthread_mutex_unlock(&output_mutex);
+                    // Build the string directly with all points
+                    worker->result_fingerprint[0] = '\0';
+                    char *ptr = worker->result_fingerprint;
+                    int remaining = MAX_FINGERPRINT_STR_LEN - 1;
+                    
+                    for (int i = 0; i < total_grid_points && remaining > 10; i++) {
+                        double scaled_value = apply_log_scale_intensity(intensity[i], max_intensity, epsilon);
+                        int written;
+                        if (i > 0) {
+                            written = snprintf(ptr, remaining, " %.4f", scaled_value);
+                        } else {
+                            written = snprintf(ptr, remaining, "%.4f", scaled_value);
+                        }
+                        
+                        if (written < 0 || written >= remaining) break;
+                        
+                        ptr += written;
+                        remaining -= written;
+                    }
+                    
+                    snprintf(worker->full_output_line, MAX_CSV_LINE_LENGTH + MAX_FINGERPRINT_STR_LEN,
+                            "%s,%s", worker->original_line_for_output, worker->result_fingerprint);
                 }
             }
+            
+            // Save diffraction image if requested
+            if (!args->no_images && args->output_dir_images) {
+                save_diffraction_image_for_molecule_cli(args, worker->smiles_to_process, row_idx, intensity, W, W);
+            }
+            
+            free(aperture_grid);
+            free(intensity);
+            worker->status = 2; // success
         } else {
+            // SMILES parsing failed
             pthread_mutex_lock(&output_mutex);
-            fprintf(stderr, "\nWarning: Worker %d failed to parse SMILES '%s' (row %d). Skipping.\n", worker->thread_id, current_smiles, current_row_idx);
-            fflush(stderr);
+            fprintf(stderr, "\nError: Failed to process SMILES '%s' on row %d\n", 
+                    worker->smiles_to_process, row_idx);
             pthread_mutex_unlock(&output_mutex);
-            snprintf(worker->full_output_line, MAX_CSV_LINE_LENGTH + MAX_FINGERPRINT_STR_LEN + 1,
-                     "%s,PARSE_ERROR", current_original_line);
+            
+            snprintf(worker->full_output_line, MAX_CSV_LINE_LENGTH + MAX_FINGERPRINT_STR_LEN,
+                     "%s,PARSE_ERROR", worker->original_line_for_output);
+            worker->status = -2; // invalid molecule
         }
         
-        pthread_mutex_unlock(&global_processing_mutex);
-
+        // Signal that the task is done
         pthread_mutex_lock(&worker->mutex);
-        if (num_parsed_atoms > 0) {
-            worker->status = complex_feature_warning ? -2 : 2;
-        } else {
-            worker->status = -1;
-        }
+        pthread_cond_signal(&worker->condition_done);
         pthread_mutex_unlock(&worker->mutex);
     }
-
-    free(aperture_grid);
-    free(intensity);
+    
     return NULL;
 }
 
@@ -715,31 +728,7 @@ int process_csv_streaming(CliArgs *args) {
         
         // Save image if needed
         if (!args->no_images && args->output_dir_images) {
-            char image_filename[512];
-            char sanitized_smiles[64];
-            strncpy(sanitized_smiles, smiles, 60);
-            sanitized_smiles[60] = '\0';
-            
-            for (char *p_san = sanitized_smiles; *p_san; ++p_san) {
-                if (!isalnum(*p_san) && *p_san != '_' && *p_san != '-') *p_san = '_';
-            }
-            
-            sprintf(image_filename, "%s/smi_r%ld_%s.%s", args->output_dir_images, 
-                    processor.processed_lines, sanitized_smiles, args->output_format_images);
-            
-            FILE *img_file = fopen(image_filename, "wb");
-            if (img_file) {
-                bool is_color = (strcmp(args->output_format_images, "ppm") == 0);
-                output_diffraction_image(img_file, intensity, W, W, is_color, args->output_format_images);
-                fclose(img_file);
-                
-                if (args->verbose) {
-                    printf("\nSaved image: %s\n", image_filename);
-                }
-            } else {
-                fprintf(stderr, "\nWarning: Could not open file to save image: %s for SMILES %s (row %ld)\n", 
-                        image_filename, smiles, processor.processed_lines);
-            }
+            save_diffraction_image_for_molecule_cli(args, smiles, processor.processed_lines, intensity, W, W);
         }
         
         free(cols);
@@ -755,7 +744,7 @@ int process_csv_streaming(CliArgs *args) {
     return 0;
 }
 
-int process_csv_parallel(CliArgs *args, int num_threads) {
+int process_csv_parallel(CliArgs *args) {
     // Set up signal handling
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -763,13 +752,11 @@ int process_csv_parallel(CliArgs *args, int num_threads) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    // Initialize processor
     CsvProcessor processor;
     if (!init_csv_processor(&processor, args->input_csv_path, args->output_csv_path, args->smiles_column_name, args)) {
         return 1;
     }
     
-    // Only read all lines into memory in parallel mode
     char **input_lines_buffer = malloc(processor.line_count * sizeof(char*));
     char **smiles_strings_buffer = malloc(processor.line_count * sizeof(char*));
     
@@ -781,232 +768,243 @@ int process_csv_parallel(CliArgs *args, int num_threads) {
         return 1;
     }
     
-    // Read all data lines into memory first
     int data_line_idx = 0;
     char *line;
     while ((line = read_csv_line(&processor)) != NULL && data_line_idx < processor.line_count) {
         char original_line_copy[MAX_CSV_LINE_LENGTH];
         strncpy(original_line_copy, line, sizeof(original_line_copy) - 1);
         original_line_copy[sizeof(original_line_copy) - 1] = '\0';
-        
         input_lines_buffer[data_line_idx] = strdup(original_line_copy);
         
-        // Extract SMILES
         char line_copy_for_parse[MAX_CSV_LINE_LENGTH];
         strcpy(line_copy_for_parse, line);
-        
         int num_cols;
         char **cols = parse_csv_line(line_copy_for_parse, &num_cols);
-        
         if (cols && num_cols > processor.smiles_column_idx) {
             smiles_strings_buffer[data_line_idx] = strdup(cols[processor.smiles_column_idx]);
         } else {
             smiles_strings_buffer[data_line_idx] = strdup("INVALID_SMILES_IN_CSV_ROW");
-            fprintf(stderr, "\nWarning: Malformed CSV line %d or SMILES column not found. Will mark as PARSE_ERROR.\n", data_line_idx);
+            fprintf(stderr, "\nWarning: Malformed CSV line %d or SMILES column not found. Will mark as PARSE_ERROR.\n", data_line_idx +1 );
         }
-        
         if (cols) free(cols);
         data_line_idx++;
     }
     
-    // Prepare worker threads
-    WorkerThread *workers = malloc(num_threads * sizeof(WorkerThread));
-    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
-    
-    if (!workers || !threads) {
-        fprintf(stderr, "Error: Failed to allocate memory for worker threads\n");
+    parsed_molecules = malloc(data_line_idx * sizeof(ParsedMoleculeData));
+    if (!parsed_molecules) {
+        fprintf(stderr, "Error: Failed to allocate memory for parsed molecule data\n");
+        for (int i = 0; i < data_line_idx; i++) { free(input_lines_buffer[i]); free(smiles_strings_buffer[i]); }
+        free(input_lines_buffer); free(smiles_strings_buffer);
         free_csv_processor(&processor);
-        
-        // Clean up
-        for (int i = 0; i < data_line_idx; i++) {
-            free(input_lines_buffer[i]);
-            free(smiles_strings_buffer[i]);
-        }
-        free(input_lines_buffer);
-        free(smiles_strings_buffer);
-        if (workers) free(workers);
-        if (threads) free(threads);
-        
         return 1;
     }
     
-    // Create output buffers
-    char **output_lines_buffer = calloc(processor.line_count, sizeof(char*));
-    bool *output_ready_flags = calloc(processor.line_count, sizeof(bool));
+    printf("Parsing %d molecules...\n", data_line_idx);
+    AtomPos **atoms_batch_ptrs = malloc(data_line_idx * sizeof(AtomPos*));
+    BondSeg **bonds_batch_ptrs = malloc(data_line_idx * sizeof(BondSeg*));
+    int *atom_counts_batch_arr = malloc(data_line_idx * sizeof(int)); // Renamed from atom_counts_batch
+    int *bond_counts_batch_arr = malloc(data_line_idx * sizeof(int)); // Renamed from bond_counts_batch
     
-    if (!output_lines_buffer || !output_ready_flags) {
-        fprintf(stderr, "Error: Failed to allocate memory for output buffers\n");
+    if (!atoms_batch_ptrs || !bonds_batch_ptrs || !atom_counts_batch_arr || !bond_counts_batch_arr) {
+        fprintf(stderr, "Error: Failed to allocate memory for batch arrays\n");
+        for (int i = 0; i < data_line_idx; i++) { free(input_lines_buffer[i]); free(smiles_strings_buffer[i]); }
+        free(input_lines_buffer); free(smiles_strings_buffer); free(parsed_molecules);
+        if (atoms_batch_ptrs) free(atoms_batch_ptrs); if (bonds_batch_ptrs) free(bonds_batch_ptrs);
+        if (atom_counts_batch_arr) free(atom_counts_batch_arr); if (bond_counts_batch_arr) free(bond_counts_batch_arr);
         free_csv_processor(&processor);
-        
-        // Clean up
-        for (int i = 0; i < data_line_idx; i++) {
-            free(input_lines_buffer[i]);
-            free(smiles_strings_buffer[i]);
-        }
-        free(input_lines_buffer);
-        free(smiles_strings_buffer);
-        free(workers);
-        free(threads);
-        if (output_lines_buffer) free(output_lines_buffer);
-        if (output_ready_flags) free(output_ready_flags);
-        
         return 1;
     }
     
-    // Initialize and create worker threads
-    for (int i = 0; i < num_threads; i++) {
-        workers[i].thread_id = i;
-        workers[i].args = args;
-        workers[i].result_fingerprint = malloc(MAX_FINGERPRINT_STR_LEN);
-        workers[i].full_output_line = malloc(MAX_CSV_LINE_LENGTH + MAX_FINGERPRINT_STR_LEN + 2);
+    int valid_molecule_count = 0;
+    for (int i = 0; i < data_line_idx; i++) {
+        parsed_molecules[i].atoms_data = NULL; parsed_molecules[i].bonds_data = NULL;
+        parsed_molecules[i].num_atoms = 0; parsed_molecules[i].num_bonds = 0;
+        parsed_molecules[i].complex_feature_warning = false;
+        parsed_molecules[i].original_row_idx = i + 1;
+        strcpy(parsed_molecules[i].original_smiles, smiles_strings_buffer[i]); // Store original SMILES
+        strcpy(parsed_molecules[i].original_line_for_output, input_lines_buffer[i]); // Store original line
+
+        if (!keep_running) { printf("\nParsing interrupted.\n"); break;}
+        float progress = (float)(i + 1) / (float)data_line_idx * 100.0f;
+        printf("\rParsing progress: %.1f%% (%d/%d)", progress, i + 1, data_line_idx); fflush(stdout);
         
-        if (!workers[i].result_fingerprint || !workers[i].full_output_line) {
-            fprintf(stderr, "Error: Failed to allocate memory for worker thread %d\n", i);
-            // Clean up previously allocated workers
-            for (int j = 0; j < i; j++) {
-                free(workers[j].result_fingerprint);
-                free(workers[j].full_output_line);
-                pthread_mutex_destroy(&workers[j].mutex);
-                pthread_cond_destroy(&workers[j].condition_task);
-                pthread_cond_destroy(&workers[j].condition_done);
-            }
-            // Clean up other resources
-            free_csv_processor(&processor);
-            for (int j = 0; j < data_line_idx; j++) {
-                free(input_lines_buffer[j]);
-                free(smiles_strings_buffer[j]);
-            }
-            free(input_lines_buffer);
-            free(smiles_strings_buffer);
-            free(output_lines_buffer);
-            free(output_ready_flags);
-            free(workers);
-            free(threads);
-            return 1;
-        }
+        initialize_molecule_data(); // Resets global atoms, bonds, counts
+        bool complex_feature_warning = false;
+        int parsed_atom_count_val = parse_smiles(smiles_strings_buffer[i], &complex_feature_warning);
         
-        workers[i].status = 0;
-        workers[i].has_new_task = false;
-        workers[i].please_exit = false;
-        pthread_mutex_init(&workers[i].mutex, NULL);
-        pthread_cond_init(&workers[i].condition_task, NULL);
-        pthread_cond_init(&workers[i].condition_done, NULL);
-        
-        pthread_create(&threads[i], NULL, process_molecule_thread, &workers[i]);
-    }
-    
-    // Process molecules in parallel
-    int tasks_dispatched = 0;
-    int tasks_written_to_file = 0;
-    printf("Processing %ld molecules using %d threads on %d CPU cores...\n", 
-           processor.line_count, num_threads, get_cpu_count());
-    
-    while (keep_running && tasks_written_to_file < processor.line_count) {
-        // Dispatch tasks to idle workers
-        if (tasks_dispatched < processor.line_count) {
-            for (int i = 0; i < num_threads; i++) {
-                if (tasks_dispatched >= processor.line_count) break;
-
-                pthread_mutex_lock(&workers[i].mutex);
-                if (workers[i].status == 0 || workers[i].status == 2 || workers[i].status == -1) {
-                    // Assign new task
-                    strcpy(workers[i].smiles_to_process, smiles_strings_buffer[tasks_dispatched]);
-                    strcpy(workers[i].original_line_for_output, input_lines_buffer[tasks_dispatched]);
-                    workers[i].original_row_idx = tasks_dispatched + 1; // 1-indexed for user-friendly display
-                    
-                    workers[i].status = 0;
-                    workers[i].has_new_task = true;
-                    pthread_cond_signal(&workers[i].condition_task);
-                    tasks_dispatched++;
-                }
-                pthread_mutex_unlock(&workers[i].mutex);
+        if (parsed_atom_count_val > 0) {
+            parsed_molecules[i].atoms_data = malloc(atom_count * sizeof(AtomPos));
+            parsed_molecules[i].bonds_data = malloc(bond_count * sizeof(BondSeg));
+            if (!parsed_molecules[i].atoms_data || !parsed_molecules[i].bonds_data) {
+                fprintf(stderr, "\nError: Failed to allocate memory for molecule %d atoms/bonds\n", i);
+                if (parsed_molecules[i].atoms_data) free(parsed_molecules[i].atoms_data);
+                if (parsed_molecules[i].bonds_data) free(parsed_molecules[i].bonds_data);
+                parsed_molecules[i].atoms_data = NULL; parsed_molecules[i].bonds_data = NULL;
+                continue;
             }
-        }
-
-        // Check for completed tasks and write them in order
-        bool wrote_something_this_cycle = false;
-        for (int i = 0; i < num_threads; i++) {
-            pthread_mutex_lock(&workers[i].mutex);
-            if ((workers[i].status == 2 || workers[i].status == -1 || workers[i].status == -2) && 
-                workers[i].original_row_idx == tasks_written_to_file + 1) {
-                // This worker has finished the task we're waiting to write next
-                output_lines_buffer[tasks_written_to_file] = strdup(workers[i].full_output_line);
-                output_ready_flags[tasks_written_to_file] = true;
-                
-                workers[i].status = 0; // Mark as idle again
-            }
-            pthread_mutex_unlock(&workers[i].mutex);
-        }
-
-        // Try to write any contiguous block of ready results
-        while (tasks_written_to_file < processor.line_count && output_ready_flags[tasks_written_to_file]) {
-            fprintf(processor.outfile, "%s\n", output_lines_buffer[tasks_written_to_file]);
-            free(output_lines_buffer[tasks_written_to_file]);
-            output_lines_buffer[tasks_written_to_file] = NULL; 
-            tasks_written_to_file++;
-            atomic_fetch_add(&total_processed_count, 1);
-            wrote_something_this_cycle = true;
-        }
-
-        // Progress display with more info
-        if (!args->verbose && processor.line_count > 0) {
-            float progress = (float)atomic_load(&total_processed_count) / (float)processor.line_count * 100.0f;
-            float speed = (float)atomic_load(&total_processed_count) / 
-                         ((float)(time(NULL) - start_time) + 0.001);
+            memcpy(parsed_molecules[i].atoms_data, atoms, atom_count * sizeof(AtomPos));
+            memcpy(parsed_molecules[i].bonds_data, bonds, bond_count * sizeof(BondSeg));
+            parsed_molecules[i].num_atoms = atom_count;
+            parsed_molecules[i].num_bonds = bond_count;
+            parsed_molecules[i].complex_feature_warning = complex_feature_warning;
             
-            pthread_mutex_lock(&output_mutex);
-            printf("\rProgress: %.1f%% (%d/%ld) - %.1f molecules/sec", 
-                   progress, atomic_load(&total_processed_count), 
-                   processor.line_count, speed);
-            fflush(stdout);
-            pthread_mutex_unlock(&output_mutex);
+            if (args->use_quantum_model || args->use_mo_effects) {
+                // apply_quantum_corrections needs to operate on the specific molecule's data
+                // Temporarily point globals, apply, then copy back (if it modifies in place)
+                AtomPos* temp_global_atoms = atoms; BondSeg* temp_global_bonds = bonds;
+                int temp_global_atom_count = atom_count; int temp_global_bond_count = bond_count;
+                atoms = parsed_molecules[i].atoms_data; atom_count = parsed_molecules[i].num_atoms;
+                bonds = parsed_molecules[i].bonds_data; bond_count = parsed_molecules[i].num_bonds;
+                apply_quantum_corrections_to_atoms();
+                // Data is modified in parsed_molecules[i].atoms_data directly
+                atoms = temp_global_atoms; bonds = temp_global_bonds;
+                atom_count = temp_global_atom_count; bond_count = temp_global_bond_count;
+            }
+            
+            atoms_batch_ptrs[valid_molecule_count] = parsed_molecules[i].atoms_data;
+            bonds_batch_ptrs[valid_molecule_count] = parsed_molecules[i].bonds_data;
+            atom_counts_batch_arr[valid_molecule_count] = parsed_molecules[i].num_atoms;
+            bond_counts_batch_arr[valid_molecule_count] = parsed_molecules[i].num_bonds;
+            valid_molecule_count++;
+        } else {
+            fprintf(stderr, "\nWarning: Failed to parse SMILES '%s' on line %d. Skipping for layout.\n", smiles_strings_buffer[i], i + 1);
+            // Mark as parse error for final output
+            snprintf(parsed_molecules[i].original_line_for_output, MAX_CSV_LINE_LENGTH, "%s,PARSE_ERROR", input_lines_buffer[i]);
         }
-        
-        // Adaptive sleep based on load
-        if (!wrote_something_this_cycle) {
-            if (tasks_dispatched == processor.line_count) {
-                usleep(1000); // Shorter sleep when waiting for final tasks
-            } else {
-                usleep(100);  // Very short sleep when actively processing
+    }
+    printf("\nParsed %d valid molecules out of %d total for layout optimization.\n", valid_molecule_count, data_line_idx);
+
+    atomic_store(&total_processed_count, 0); // Reset for output progress
+
+    if (valid_molecule_count > 0) {
+        printf("Optimizing molecular layouts with %d iterations...\n", args->layout_iterations);
+        int layout_batch_size = cuda_batch_size > 0 ? cuda_batch_size : 100; // Use cuda_batch_size for layout batching too
+
+        for (int batch_start_idx = 0; batch_start_idx < valid_molecule_count; batch_start_idx += layout_batch_size) {
+            if (!keep_running) { printf("\nLayout optimization interrupted.\n"); break; }
+            
+            int current_layout_batch_size = valid_molecule_count - batch_start_idx;
+            if (current_layout_batch_size > layout_batch_size) current_layout_batch_size = layout_batch_size;
+
+            printf("\rOptimizing layout for batch: molecules %d-%d of %d valid molecules... ",
+                   batch_start_idx + 1, batch_start_idx + current_layout_batch_size, valid_molecule_count);
+            fflush(stdout);
+
+            optimize_molecule_layout_batch(
+                &atoms_batch_ptrs[batch_start_idx],
+                &atom_counts_batch_arr[batch_start_idx],
+                &bonds_batch_ptrs[batch_start_idx],
+                &bond_counts_batch_arr[batch_start_idx],
+                current_layout_batch_size,
+                args->layout_iterations, args->k_spring, args->k_repulsive,
+                args->damping_factor, args->time_step_factor
+            );
+            
+            // After layout for this batch, generate diffraction patterns and output
+            printf("\rGenerating diffraction & output for layout batch %d-%d... ",
+                   batch_start_idx + 1, batch_start_idx + current_layout_batch_size);
+            fflush(stdout);
+
+            for (int k = 0; k < current_layout_batch_size; ++k) {
+                if (!keep_running) { printf("\nOutput generation interrupted for layout batch.\n"); break; }
+
+                // Find the original index in parsed_molecules array
+                // This relies on atoms_batch_ptrs being populated sequentially from valid parsed_molecules
+                int original_molecule_array_idx = -1;
+                int count_valid = 0;
+                for(int scan_idx = 0; scan_idx < data_line_idx; ++scan_idx) {
+                    if(parsed_molecules[scan_idx].atoms_data && parsed_molecules[scan_idx].num_atoms > 0) { // valid and was processed for layout
+                        if(count_valid == batch_start_idx + k) {
+                            original_molecule_array_idx = scan_idx;
+                            break;
+                        }
+                        count_valid++;
+                    }
+                }
+                
+                if (original_molecule_array_idx != -1) {
+                    ParsedMoleculeData* current_mol_data = &parsed_molecules[original_molecule_array_idx];
+                    
+                    // Set globals for the diffraction engine functions
+                    AtomPos* prev_atoms = atoms; BondSeg* prev_bonds = bonds;
+                    int prev_atom_count = atom_count; int prev_bond_count = bond_count;
+                    atoms = current_mol_data->atoms_data; atom_count = current_mol_data->num_atoms;
+                    bonds = current_mol_data->bonds_data; bond_count = current_mol_data->num_bonds;
+
+                    if (atom_count > 0) { // Check if molecule is valid after all
+                        int fp_width = 0, fp_height = 0;
+                        double max_intensity_val = 0.0;
+                        double* fingerprint_val = generate_diffraction_for_molecule_cli(args, &fp_width, &fp_height, &max_intensity_val);
+
+                        char fingerprint_str_buffer[MAX_FINGERPRINT_STR_LEN];
+                        char full_output_line_buffer[MAX_CSV_LINE_LENGTH + MAX_FINGERPRINT_STR_LEN + 2];
+
+                        if (fingerprint_val) {
+                            format_fingerprint_for_csv_cli(args, current_mol_data->original_smiles, current_mol_data->original_line_for_output,
+                                                      fp_width, fp_height, fingerprint_val,
+                                                      fingerprint_str_buffer, MAX_FINGERPRINT_STR_LEN,
+                                                      full_output_line_buffer, sizeof(full_output_line_buffer), max_intensity_val);
+                            
+                            save_diffraction_image_for_molecule_cli(args, current_mol_data->original_smiles, current_mol_data->original_row_idx, fingerprint_val, fp_width, fp_height);
+                            free(fingerprint_val);
+                        } else {
+                            snprintf(full_output_line_buffer, sizeof(full_output_line_buffer), "%s,DIFFRACTION_ERROR_BATCH", current_mol_data->original_line_for_output);
+                        }
+                        pthread_mutex_lock(&output_mutex);
+                        fprintf(processor.outfile, "%s\n", full_output_line_buffer);
+                        fflush(processor.outfile);
+                        pthread_mutex_unlock(&output_mutex);
+                    } else { // Molecule became invalid or was marked as PARSE_ERROR earlier
+                         pthread_mutex_lock(&output_mutex);
+                         // If original_line_for_output already contains PARSE_ERROR, just print that
+                         fprintf(processor.outfile, "%s\n", current_mol_data->original_line_for_output);
+                         fflush(processor.outfile);
+                         pthread_mutex_unlock(&output_mutex);
+                    }
+                    // Restore globals
+                    atoms = prev_atoms; bonds = prev_bonds;
+                    atom_count = prev_atom_count; bond_count = prev_bond_count;
+                }
+                 atomic_fetch_add(&total_processed_count, 1);
+                 if (!args->verbose && processor.line_count > 0) {
+                    float current_progress = (float)atomic_load(&total_processed_count) / (float)data_line_idx * 100.0f;
+                    float current_speed = (float)atomic_load(&total_processed_count) / ((float)(time(NULL) - start_time) + 0.001f);
+                     printf("\rOverall Progress: %.1f%% (%d/%d) - %.1f mol/sec", current_progress, atomic_load(&total_processed_count), data_line_idx, current_speed);
+                     fflush(stdout);
+                 }
+            } // End loop over molecules in current_layout_batch
+            if (!keep_running) break;
+        } // End loop over all layout batches
+    } else { // No valid molecules
+        // Write out any molecules that had parse errors during initial scan
+        for(int i=0; i < data_line_idx; ++i) {
+            if (strstr(parsed_molecules[i].original_line_for_output, "PARSE_ERROR")) {
+                pthread_mutex_lock(&output_mutex);
+                fprintf(processor.outfile, "%s\n", parsed_molecules[i].original_line_for_output);
+                fflush(processor.outfile);
+                pthread_mutex_unlock(&output_mutex);
+                atomic_fetch_add(&total_processed_count, 1);
             }
         }
     }
-    
-    // Signal threads to exit
-    for (int i = 0; i < num_threads; i++) {
-        pthread_mutex_lock(&workers[i].mutex);
-        workers[i].please_exit = true;
-        pthread_cond_signal(&workers[i].condition_task);
-        pthread_mutex_unlock(&workers[i].mutex);
-    }
+    printf("\nProcessing complete or interrupted. Total processed: %d / %d\n", atomic_load(&total_processed_count), data_line_idx);
 
-    // Wait for threads to finish
-    for (int i = 0; i < num_threads; i++) {
-        pthread_join(threads[i], NULL);
-    }
-    
-    // Clean up all the other resources
-    for (int i = 0; i < processor.line_count; i++) {
+    // Clean up resources
+    for (int i = 0; i < data_line_idx; i++) {
         if (input_lines_buffer[i]) free(input_lines_buffer[i]);
         if (smiles_strings_buffer[i]) free(smiles_strings_buffer[i]);
-        if (output_lines_buffer[i]) free(output_lines_buffer[i]);
+        if (parsed_molecules && parsed_molecules[i].atoms_data) free(parsed_molecules[i].atoms_data);
+        if (parsed_molecules && parsed_molecules[i].bonds_data) free(parsed_molecules[i].bonds_data);
     }
-    
     free(input_lines_buffer);
     free(smiles_strings_buffer);
-    free(output_lines_buffer);
-    free(output_ready_flags);
-    free(workers);
-    free(threads);
+    if (parsed_molecules) free(parsed_molecules); parsed_molecules = NULL;
+    if (atoms_batch_ptrs) free(atoms_batch_ptrs);
+    if (bonds_batch_ptrs) free(bonds_batch_ptrs);
+    if (atom_counts_batch_arr) free(atom_counts_batch_arr);
+    if (bond_counts_batch_arr) free(bond_counts_batch_arr);
     
-    if (!keep_running) {
-        printf("\nProcessing interrupted. Processed %d/%ld molecules.\n",
-               atomic_load(&total_processed_count), processor.line_count);
-    } else {
-        printf("\nProcessing complete. Output written to %s\n", args->output_csv_path);
-    }
     free_csv_processor(&processor);
-    
     return 0;
 }
 
@@ -1068,6 +1066,8 @@ void print_cli_help(const char *prog_name) {
     fprintf(stderr, "  The output CSV will contain all original columns plus a new 'Fingerprint' column (space-separated)\n");
     fprintf(stderr, "  or multiple FP_N columns (column-format).\n");
     fprintf(stderr, "  Fingerprint values are log-scaled intensities from the diffraction pattern.\n");
+    fprintf(stderr, "  --device <device>      Compute device (cuda, cpu, auto). Default: auto\n");
+    fprintf(stderr, "  --cuda-batch-size <n>  Batch size for CUDA processing. Default: 256\n");
 }
 
 int parse_cli_arguments(int argc, char **argv, CliArgs *args) {
@@ -1180,6 +1180,34 @@ int parse_cli_arguments(int argc, char **argv, CliArgs *args) {
             // Resolution check will be done after resolution is parsed, or here if resolution is always parsed before.
             // For safety, check it later or ensure parsing order.
             // For now, we'll assume resolution is known or check it when both are parsed.
+        } else if (strcmp(argv[i], "--device") == 0 || strcmp(argv[i], "-d") == 0) {
+            if (i + 1 < argc) {
+                const char* device = argv[++i];
+                if (strcmp(device, "cuda") == 0) {
+                    use_cuda = 2;  // Force CUDA
+                } else if (strcmp(device, "cpu") == 0) {
+                    use_cuda = 0;  // Force CPU
+                } else if (strcmp(device, "auto") == 0) {
+                    use_cuda = 1;  // Auto-select
+                } else {
+                    fprintf(stderr, "Error: Unknown device '%s'. Use 'cuda', 'cpu', or 'auto'.\n", device);
+                    return 0;
+                }
+            } else {
+                fprintf(stderr, "Error: --device option requires an argument.\n");
+                return 0;
+            }
+        } else if (strcmp(argv[i], "--cuda-batch-size") == 0) {
+            if (i + 1 < argc) {
+                cuda_batch_size = atoi(argv[++i]);
+                if (cuda_batch_size <= 0) {
+                    fprintf(stderr, "Error: CUDA batch size must be positive.\n");
+                    return 0;
+                }
+            } else {
+                fprintf(stderr, "Error: --cuda-batch-size option requires an argument.\n");
+                return 0;
+            }
         } else {
             fprintf(stderr, "Error: Unknown or incomplete option '%s'.\n", argv[i]);
             print_cli_help(argv[0]);
@@ -1244,27 +1272,226 @@ int main(int argc, char **argv) {
     
     int parse_result = parse_cli_arguments(argc, argv, &args);
     if (parse_result <= 0) {
-        free(args.colormap_name);
-        free(args.output_format_images);
-        free(args.smiles_column_name);
+        // Args cleanup is handled by parse_cli_arguments or here if early exit
+        if(args.colormap_name) free(args.colormap_name);
+        if(args.output_format_images) free(args.output_format_images);
+        if(args.smiles_column_name) free(args.smiles_column_name);
         return (parse_result == 0) ? 0 : 1;
     }
     
-    // Add this line in main() before the if statement that checks args.num_jobs
     start_time = time(NULL);
     
     int result;
-    if (args.num_jobs > 1 && !args.use_streaming) {
-        // Multi-threaded parallel processing
-        result = process_csv_parallel(&args, args.num_jobs);
-    } else {
-        // Single-threaded or multi-threaded streaming processing
+    // The choice between process_csv_parallel and process_csv_streaming might need to be re-evaluated.
+    // Forcing parallel for now as it's been heavily modified.
+    if (args.num_jobs > 0) { // Modified to always use this path for now
+        result = process_csv_parallel(&args);
+    } else { // Fallback or explicit streaming
         result = process_csv_streaming(&args);
     }
     
-    free(args.colormap_name);
-    free(args.output_format_images);
-    free(args.smiles_column_name);
+    if(args.colormap_name) free(args.colormap_name);
+    if(args.output_format_images) free(args.output_format_images);
+    if(args.smiles_column_name) free(args.smiles_column_name);
+    
+    if (atoms != NULL) { free(atoms); atoms = NULL; }
+    if (bonds != NULL) { free(bonds); bonds = NULL; }
     
     return result;
+}
+
+// Implementation of previously forward-declared helper functions
+static double* generate_diffraction_for_molecule_cli(CliArgs *args, int *fp_width_out, int *fp_height_out, double *max_intensity_out) {
+    int W = args->resolution;
+    int total_grid_points = W * W;
+    
+    // Initialize grid for molecule drawing
+    complex double *aperture_grid = calloc(total_grid_points, sizeof(complex double));
+    double *intensity = malloc(total_grid_points * sizeof(double));
+    
+    if (!aperture_grid || !intensity) {
+        fprintf(stderr, "Error: Failed to allocate memory for grid arrays\n");
+        if (aperture_grid) free(aperture_grid);
+        if (intensity) free(intensity);
+        return NULL;
+    }
+    
+    // Draw atoms and bonds on grid
+    for (int i = 0; i < atom_count; i++) {
+        draw_atom_on_grid(aperture_grid, W, atoms[i], i, args->use_quantum_model);
+    }
+    
+    for (int i = 0; i < bond_count; i++) {
+        draw_bond_on_grid(aperture_grid, W, bonds[i], args->use_quantum_model);
+    }
+    
+    // Add molecular orbital effects if enabled
+    if (args->use_mo_effects) {
+        add_molecular_orbital_effects(aperture_grid, W);
+    }
+    
+    // Calculate diffraction pattern
+    fft_2d(aperture_grid, W, W, 1);
+    
+    // Calculate intensity
+    double max_intensity = 0.0;
+    for (int i = 0; i < total_grid_points; i++) {
+        intensity[i] = cabs(aperture_grid[i]) * cabs(aperture_grid[i]);
+        if (intensity[i] > max_intensity) max_intensity = intensity[i];
+    }
+    
+    // Apply condensation if requested
+    double *final_intensity = intensity;
+    int final_width = W;
+    int final_height = W;
+    
+    if (args->condense_block_size > 1) {
+        int condensed_width = W / args->condense_block_size;
+        int condensed_height = W / args->condense_block_size;
+        double *condensed_intensity = malloc(condensed_width * condensed_height * sizeof(double));
+        
+        if (condensed_intensity) {
+            condense_fingerprint_average(intensity, W, W, args->condense_block_size, 
+                                         condensed_intensity, &condensed_width, &condensed_height);
+            free(intensity);
+            final_intensity = condensed_intensity;
+            final_width = condensed_width;
+            final_height = condensed_height;
+        } else {
+            fprintf(stderr, "Warning: Failed to allocate memory for condensed fingerprint, using full resolution\n");
+        }
+    }
+    
+    // Set output parameters
+    *fp_width_out = final_width;
+    *fp_height_out = final_height;
+    *max_intensity_out = max_intensity;
+    
+    // Free temporary resources
+    free(aperture_grid);
+    
+    return final_intensity;
+}
+
+static void format_fingerprint_for_csv_cli(CliArgs *args, const char* smiles, const char* original_line, 
+                                      int fp_width, int fp_height, const double* fingerprint_data, 
+                                      char* fingerprint_str_out, int max_fp_str_len, 
+                                      char* full_output_line_out, int max_full_line_len, 
+                                      double max_intensity) {
+    int total_grid_points = fp_width * fp_height;
+    double epsilon = max_intensity * 1.0e-7;
+    if (epsilon < 1.0e-10) epsilon = 1.0e-10;
+    
+    if (args->column_format) {
+        // For column format, we'll write the original line followed by fingerprint values as separate columns
+        snprintf(full_output_line_out, max_full_line_len, "%s", original_line);
+        
+        int offset = strlen(full_output_line_out);
+        int remaining = max_full_line_len - offset - 1;
+        char *ptr = full_output_line_out + offset;
+        
+        for (int i = 0; i < total_grid_points && remaining > 10; i++) {
+            double scaled_value = apply_log_scale_intensity(fingerprint_data[i], max_intensity, epsilon);
+            int written = snprintf(ptr, remaining, ",%.4f", scaled_value);
+            if (written < 0 || written >= remaining) {
+                // Won't fit, stop here
+                break;
+            }
+            ptr += written;
+            remaining -= written;
+        }
+    } else {
+        // For row format, we need to check if all values will fit
+        int est_chars_per_value = 8; // Approximate length for ",0.1234" or ",12.34"
+        int max_values = (max_full_line_len - strlen(original_line) - 32) / est_chars_per_value;
+        
+        if (max_values < total_grid_points) {
+            // Will truncate, so use a condensed format - only include every Nth point
+            int stride = (total_grid_points + max_values - 1) / max_values;
+            
+            // First format the fingerprint as a separate string
+            fingerprint_str_out[0] = '\0';
+            char *ptr = fingerprint_str_out;
+            int remaining = max_fp_str_len - 1;
+            
+            for (int i = 0; i < total_grid_points; i += stride) {
+                double scaled_value = apply_log_scale_intensity(fingerprint_data[i], max_intensity, epsilon);
+                int written;
+                if (i > 0) {
+                    written = snprintf(ptr, remaining, " %.4f", scaled_value);
+                } else {
+                    written = snprintf(ptr, remaining, "%.4f", scaled_value);
+                }
+                
+                if (written < 0 || written >= remaining) break;
+                
+                ptr += written;
+                remaining -= written;
+            }
+            
+            // Now combine with the original line
+            snprintf(full_output_line_out, max_full_line_len, "%s,%s", original_line, fingerprint_str_out);
+        } else {
+            // All values will fit, format them directly
+            fingerprint_str_out[0] = '\0';
+            char *ptr = fingerprint_str_out;
+            int remaining = max_fp_str_len - 1;
+            
+            for (int i = 0; i < total_grid_points && remaining > 10; i++) {
+                double scaled_value = apply_log_scale_intensity(fingerprint_data[i], max_intensity, epsilon);
+                int written;
+                if (i > 0) {
+                    written = snprintf(ptr, remaining, " %.4f", scaled_value);
+                } else {
+                    written = snprintf(ptr, remaining, "%.4f", scaled_value);
+                }
+                
+                if (written < 0 || written >= remaining) break;
+                
+                ptr += written;
+                remaining -= written;
+            }
+            
+            snprintf(full_output_line_out, max_full_line_len, "%s,%s", original_line, fingerprint_str_out);
+        }
+    }
+}
+
+static void save_diffraction_image_for_molecule_cli(CliArgs *args, const char* smiles, int original_row_idx,
+                                               const double* fingerprint_data, int fp_width, int fp_height) {
+    // Skip if no image output is requested
+    if (args->no_images || !args->output_dir_images) {
+        return;
+    }
+    
+    // Create sanitized SMILES for filename (replace non-alphanumeric chars with underscore)
+    char sanitized_smiles[64];
+    strncpy(sanitized_smiles, smiles, 60);
+    sanitized_smiles[60] = '\0';
+    
+    for (char *p = sanitized_smiles; *p; p++) {
+        if (!isalnum(*p) && *p != '_' && *p != '-') *p = '_';
+    }
+    
+    // Build image filename
+    char image_filename[512];
+    snprintf(image_filename, sizeof(image_filename), "%s/smi_r%d_%s.%s", args->output_dir_images, 
+            original_row_idx, sanitized_smiles, args->output_format_images);
+    
+    // Open file for writing
+    FILE *img_file = fopen(image_filename, "wb");
+    if (!img_file) {
+        fprintf(stderr, "Warning: Could not open file to save image: %s\n", image_filename);
+        return;
+    }
+    
+    // Write image data
+    bool is_color = (strcmp(args->output_format_images, "ppm") == 0);
+    output_diffraction_image(img_file, fingerprint_data, fp_width, fp_height, 
+                           is_color, args->output_format_images);
+    fclose(img_file);
+    
+    if (args->verbose) {
+        printf("Saved image: %s\n", image_filename);
+    }
 }

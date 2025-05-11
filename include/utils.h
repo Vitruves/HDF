@@ -11,8 +11,7 @@
 #define PLANCK_CONSTANT 6.62607015e-34  /* J⋅s */
 #define ELECTRON_MASS 9.1093837015e-31  /* kg */
 #define ATOMIC_MASS_UNIT 1.66053906660e-27  /* kg */
-#define ANGSTROM 1e-10  /* m */
-#define BOHR_RADIUS 5.29177210903e-11  /* m */
+// Using ANGSTROM and BOHR_RADIUS from globals.h
 
 double clamp_double(double value, double min, double max);
 double min_double(double a, double b);
