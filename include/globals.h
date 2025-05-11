@@ -22,6 +22,7 @@ extern int bond_count;
 // Global settings
 extern int use_cuda;
 extern int cuda_batch_size;
+extern bool cuda_verbose;
 extern ColormapType colormap_global;
 extern RingRef rings[10];
 

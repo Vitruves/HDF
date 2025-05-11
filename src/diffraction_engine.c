@@ -38,11 +38,8 @@ static cuDoubleComplex make_cuDoubleComplex(double x, double y) {
 // Add this variable to track if CUDA is available
 static int cuda_available = -1; // -1: not checked, 0: not available, 1: available
 
-// Function to check CUDA availability (declared in diffraction_engine_cuda.h)
-extern int cuda_check_available(void);
-
 // Wrapper for checking CUDA availability
-static int check_cuda_available() {
+int check_cuda_available(void) {
     // If CPU is forced, return 0
     if (use_cuda == 0) {
         printf("CPU mode selected. Using CPU implementation.\n");
@@ -68,38 +65,86 @@ static int check_cuda_available() {
 
 // Classical phase calculation (simpler model if QM is off)
 static double calculate_atom_phase_classical(AtomPos atom, int idx) {
-    double base_phase = (atom.atomic_number * PI) / 36.0;
-    base_phase += (atom.isotope % 10) * PI / 20.0; // Isotope effect
-    base_phase += atom.explicit_h_count * PI / 30.0; // H count effect
-
-    double en_factor = atom.electronegativity / 4.0;
-    double valence_effect = (atom.valence / 8.0) * PI;
-    unsigned int hash = hash_string(atom.atom, idx + atom.isotope); // Salt with isotope
-    double position_salt = (hash % 1000) / 1000.0;
-    double charge_effect = (atom.charge != 0) ? atom.charge * PI / 6.0 : 0.0; // Slightly stronger charge effect
-    double aromatic_shift = atom.is_aromatic ? PI / 6.0 : 0.0;
-    double ring_shift = atom.in_ring ? PI / 10.0 : 0.0; // Effect if atom is in any ring
+    // Base phase from atom properties - make more distinctive
+    double base_phase = (atom.atomic_number * PI) / 18.0; // Increased sensitivity to atomic number
     
-    return fmod(base_phase + en_factor * PI + valence_effect + 
-                position_salt * PI / 4.0 + charge_effect + aromatic_shift + ring_shift, 
-                2 * PI);
+    // Add more diverse properties
+    base_phase += (atom.isotope % 10) * PI / 15.0; // Stronger isotope effect
+    base_phase += atom.explicit_h_count * PI / 20.0; // Enhanced H count effect
+    base_phase += atom.ring_count * PI / 10.0; // Include ring membership information
+    
+    // Add pharmacophore information
+    if (atom.is_pharmacophore) {
+        base_phase += (atom.pharmacophore_type + 1) * PI / 12.0;
+    }
+    
+    // Include hybridization information
+    base_phase += atom.hybridization * PI / 8.0;
+    
+    // Electronegativity contribution - more sensitive
+    double en_factor = atom.electronegativity / 3.0;
+    
+    // Valence contribution
+    double valence_effect = (atom.valence / 6.0) * PI;
+    
+    // Position randomization - more sensitive to molecule structure
+    unsigned int hash = hash_string(atom.atom, idx + atom.isotope + atom.n_bonds); 
+    double position_salt = (hash % 1000) / 500.0;
+    
+    // Stronger charge effects
+    double charge_effect = (atom.charge != 0) ? atom.charge * PI / 4.0 : 0.0;
+    
+    // Enhanced aromaticity and ring contributions
+    double aromatic_shift = atom.is_aromatic ? PI / 4.0 : 0.0;
+    double ring_shift = atom.in_ring ? PI / 8.0 : 0.0;
+    
+    // Add topological information
+    double topo_effect = 0.0;
+    if (atom.is_rotatable_bond_atom) topo_effect += PI / 6.0;
+    if (atom.solvent_accessibility > 0.5) topo_effect += PI / 7.0;
+    
+    return fmod(base_phase + en_factor * PI + valence_effect + position_salt * PI / 2.0 + 
+                charge_effect + aromatic_shift + ring_shift + topo_effect, 2 * PI);
 }
 
 static double calculate_bond_phase_classical(BondSeg bond) {
-    double order_phase = bond.order * PI / 4.0;
+    // Enhance order-based phase
+    double order_phase = bond.order * PI / 3.0;
+    
+    // More distinctive aromatic bond contributions
     double type_phase = 0.0;
     if (bond.type == BOND_AROMATIC) {
-        type_phase = PI / 3.0;
+        type_phase = PI / 2.0;
     }
-    // Accessing atom properties for the bond
+    
+    // Access atom properties for more distinctive features
     AtomPos atom_a = atoms[bond.a];
     AtomPos atom_b = atoms[bond.b];
-    double charge_diff_effect = abs(atom_a.charge - atom_b.charge) * PI / 12.0;
-
-    double ring_effect = bond.in_ring ? PI / 5.0 : 0.0;
-    double length_effect = (bond.length > 0.1 ? (bond.length - 1.0) : 0.0) * PI / 10.0; 
     
-    return fmod(order_phase + type_phase + ring_effect + length_effect + charge_diff_effect, 2 * PI);
+    // Enhanced charge difference effects
+    double charge_diff_effect = abs(atom_a.charge - atom_b.charge) * PI / 8.0;
+    
+    // Add bond polarity based on electronegativity difference
+    double en_diff = fabs(atom_a.electronegativity - atom_b.electronegativity);
+    double polarity_effect = en_diff * PI / 7.0;
+    
+    // Enhanced ring effects
+    double ring_effect = bond.in_ring ? PI / 4.0 : 0.0;
+    
+    // Bond conjugation effects
+    double conjugation_effect = bond.is_conjugated ? PI / 5.0 : 0.0;
+    
+    // Rotatable bond information
+    double rotatable_effect = bond.is_rotatable ? PI / 3.0 : 0.0;
+    
+    // Enhanced length effect - more sensitive to geometry
+    double length_effect = (bond.length > 0.1 ? (bond.length - 1.0) * 2.0 : 0.0) * PI / 8.0;
+    
+    // Include bond energy for more chemical information
+    double energy_effect = (bond.bond_energy / 100.0) * PI / 6.0;
+    
+    return fmod(order_phase + type_phase + ring_effect + length_effect + charge_diff_effect + 
+                polarity_effect + conjugation_effect + rotatable_effect + energy_effect, 2 * PI);
 }
 
 
@@ -235,9 +280,20 @@ static complex double cuDoubleComplex_to_complex(cuDoubleComplex z) {
     return z.x + z.y * I;
 }
 
+#if defined(HAS_CUDA) || defined(__CUDACC__)
+// When CUDA is available, use the make_cuDoubleComplex provided by CUDA headers
 static cuDoubleComplex complex_to_cuDoubleComplex(complex double z) {
     return make_cuDoubleComplex(creal(z), cimag(z));
 }
+#else
+// When CUDA is not available, use our own implementation
+static cuDoubleComplex complex_to_cuDoubleComplex(complex double z) {
+    cuDoubleComplex result;
+    result.x = creal(z);
+    result.y = cimag(z);
+    return result;
+}
+#endif
 
 // Modify draw_atom_on_grid and draw_bond_on_grid to use CUDA when available
 void draw_atom_on_grid(complex double *aperture_grid, int grid_width, AtomPos atom, int atom_idx, bool use_quantum_model) {
@@ -260,14 +316,28 @@ void draw_atom_on_grid(complex double *aperture_grid, int grid_width, AtomPos at
     double atom_display_radius_px; 
 
     if (use_quantum_model) {
-        base_amplitude = 1.0 + 0.1 * atom.effective_nuclear_charge + 0.1 * atom.valence;
-        base_amplitude += 0.05 * (atom.isotope % 10); // Isotope effect on amplitude
-        base_amplitude += 0.02 * atom.explicit_h_count;
-        base_amplitude *= (1.0 + 0.1 * atom.charge); // Charge effect
-        if(atom.in_ring) base_amplitude *= 1.05; // Slightly emphasize ring atoms
-
-        atom_display_radius_px = (atom.radius * scale_factor) * (1.0 + 0.3 * atom.valence + 0.1 * atom.hybridization);
-        atom_display_radius_px = min_double(5.0 * z_depth_effect, atom_display_radius_px); 
+        // Make amplitude more sensitive to atom-specific properties
+        base_amplitude = 1.2 + 0.2 * atom.effective_nuclear_charge + 0.15 * atom.valence;
+        base_amplitude += 0.08 * (atom.isotope % 10);
+        base_amplitude += 0.05 * atom.explicit_h_count;
+        base_amplitude *= (1.0 + 0.15 * atom.charge);
+        
+        // Enhance ring system differentiation
+        if(atom.in_ring) base_amplitude *= (1.10 + 0.05 * atom.ring_count);
+        
+        // Add pharmacophore contribution
+        if(atom.is_pharmacophore) base_amplitude *= (1.15 + 0.08 * atom.pharmacophore_type);
+        
+        // Add solvent accessibility contribution
+        base_amplitude *= (1.0 + 0.12 * atom.solvent_accessibility);
+        
+        // More distinctive radius calculation
+        atom_display_radius_px = (atom.radius * scale_factor) * 
+                                (1.2 + 0.35 * atom.valence + 0.15 * atom.hybridization);
+        if(atom.is_aromatic) atom_display_radius_px *= 1.15;
+        
+        // Cap max radius at a higher value for better discrimination
+        atom_display_radius_px = min_double(6.0 * z_depth_effect, atom_display_radius_px);
     } else {
         base_amplitude = 1.0 + 0.2 * atom.atomic_number / 10.0;
         base_amplitude += 0.1 * (atom.isotope % 10);
@@ -410,7 +480,7 @@ void draw_bond_on_grid(complex double *aperture_grid, int grid_width, BondSeg bo
     }
 }
 
-// Add a new function that uses CUDA for drawing molecules
+// Modify the draw_molecule_on_grid function near line 429
 void draw_molecule_on_grid(complex double *aperture_grid, int grid_width, bool use_quantum_model) {
     if (check_cuda_available() && !use_quantum_model) {
         // Use CUDA implementation for classical model
@@ -442,6 +512,67 @@ void draw_molecule_on_grid(complex double *aperture_grid, int grid_width, bool u
         for (int i = 0; i < bond_count; ++i) {
             draw_bond_on_grid(aperture_grid, grid_width, bonds[i], use_quantum_model);
         }
+    }
+
+    // Add 3D-specific phase modulations
+    for (int i = 0; i < atom_count; i++) {
+        // Create Z-dependent phase modulation
+        double z_phase = atoms[i].z * 0.2; // Increased Z sensitivity
+        
+        // Calculate grid position of the atom with perspective scaling
+        double focal_length = (double)grid_width;
+        double z_depth_effect = focal_length / (focal_length + atoms[i].z * 5.0);
+        z_depth_effect = clamp_double(z_depth_effect, 0.1, 2.0);
+        double scale_factor = (grid_width / 8.0) * z_depth_effect;
+        
+        int center_x = (int)(atoms[i].x * scale_factor + grid_width / 2.0);
+        int center_y = (int)(atoms[i].y * scale_factor + grid_width / 2.0);
+        
+        // Apply z-phase modulation to a small area around the atom
+        int effect_radius = (int)(atoms[i].radius * scale_factor * 2.0);
+        if (effect_radius < 1) effect_radius = 1;
+        
+        for (int dy = -effect_radius; dy <= effect_radius; dy++) {
+            for (int dx = -effect_radius; dx <= effect_radius; dx++) {
+                int px = center_x + dx;
+                int py = center_y + dy;
+                
+                if (px >= 0 && px < grid_width && py >= 0 && py < grid_width) {
+                    int idx = py * grid_width + px;
+                    complex double z_modifier = cexp(I * z_phase);
+                    aperture_grid[idx] *= z_modifier;
+                }
+            }
+        }
+    }
+
+    // Add molecular orbital effects
+    add_molecular_orbital_effects(aperture_grid, grid_width);
+    
+    // For quantum models, add enhanced electronic structure effects
+    if (use_quantum_model) {
+        // First, calculate partial charges if they haven't been calculated yet
+        bool needs_charge_calculation = true;
+        for (int i = 0; i < atom_count; i++) {
+            if (atoms[i].partial_charge != 0.0) {
+                needs_charge_calculation = false;
+                break;
+            }
+        }
+        
+        if (needs_charge_calculation && atom_count > 0) {
+            calculate_partial_charges(atoms, atom_count, bonds, bond_count);
+            
+            // Calculate atomic properties for quantum model
+            for (int i = 0; i < atom_count; i++) {
+                atoms[i].atomic_hardness = calculate_atomic_hardness(atoms[i]);
+                atoms[i].atomic_softness = calculate_atomic_softness(atoms[i]);
+                atoms[i].electronic_spatial_extent = calculate_electronic_spatial_extent(atoms[i]);
+            }
+        }
+        
+        // Add enhanced quantum electronic effects to the diffraction pattern
+        enhance_diffraction_with_electronic_effects(aperture_grid, grid_width, atoms, atom_count, bonds, bond_count);
     }
 }
 
@@ -548,103 +679,111 @@ void apply_log_scale_intensity_cuda(double *intensity, double *scaled_intensity,
 void add_molecular_orbital_effects(complex double *aperture_grid, int grid_width) {
     if (atom_count == 0) return;
 
+    // More advanced conjugated system detection
     int *conjugated_system_map = calloc(atom_count, sizeof(int));
-    if (!conjugated_system_map) { /* ... error ... */ return; }
+    if (!conjugated_system_map) { return; }
     int current_system_id = 0;
-
-    // Identify conjugated systems (simplified)
+    
+    // Enhanced conjugated system detection
+    // Include Pi systems that aren't necessarily aromatic
     for (int i = 0; i < atom_count; i++) {
-        if (atoms[i].is_aromatic && conjugated_system_map[i] == 0) {
+        // Look for Pi systems (sp2 hybridized atoms, not just aromatic)
+        if ((atoms[i].is_aromatic || 
+            (atoms[i].hybridization > 1.5 && atoms[i].hybridization < 2.5)) &&
+            conjugated_system_map[i] == 0) {
             current_system_id++;
-            int *queue = malloc(atom_count * sizeof(int));
-            int head = 0, tail = 0;
-            if (!queue) { free(conjugated_system_map); /* ... error ... */ return; }
-            queue[tail++] = i;
+            
+            // Find all connected atoms in the Pi system through BFS
+            int queue[atom_count];
+            int front = 0, rear = 0;
+            queue[rear++] = i;
             conjugated_system_map[i] = current_system_id;
-            while(head < tail) {
-                int u = queue[head++];
-                for (int b_idx = 0; b_idx < bond_count; ++b_idx) {
-                    if (bonds[b_idx].type == BOND_AROMATIC || 
-                        ( (atoms[bonds[b_idx].a].is_aromatic || atoms[bonds[b_idx].b].is_aromatic) && bonds[b_idx].order >=1 ) ) {
-                        int v = -1;
-                        if (bonds[b_idx].a == u) v = bonds[b_idx].b;
-                        else if (bonds[b_idx].b == u) v = bonds[b_idx].a;
-                        if (v != -1 && atoms[v].is_aromatic && conjugated_system_map[v] == 0) {
-                            conjugated_system_map[v] = current_system_id;
-                            if (tail < atom_count) queue[tail++] = v;
-                        }
+            
+            int num_atoms_in_system = 1; // Track atoms in this system
+            
+            while (front < rear) {
+                int curr = queue[front++];
+                
+                // Check bonds to find connected atoms
+                for (int b = 0; b < bond_count; b++) {
+                    int next_atom = -1;
+                    if (bonds[b].a == curr) next_atom = bonds[b].b;
+                    else if (bonds[b].b == curr) next_atom = bonds[b].a;
+                    
+                    if (next_atom != -1 && conjugated_system_map[next_atom] == 0 &&
+                        (atoms[next_atom].is_aromatic || 
+                         (atoms[next_atom].hybridization > 1.5 && atoms[next_atom].hybridization < 2.5))) {
+                        conjugated_system_map[next_atom] = current_system_id;
+                        queue[rear++] = next_atom;
+                        num_atoms_in_system++;
                     }
                 }
             }
-            free(queue);
-        }
-    }
-
-    double focal_length = (double)grid_width;
-
-    for (int sys_id = 1; sys_id <= current_system_id; sys_id++) {
-        double com_x = 0, com_y = 0, com_z = 0; // Include Z for system center
-        int num_atoms_in_system = 0;
-        double max_extent_sq = 0;
-
-        for (int i = 0; i < atom_count; i++) {
-            if (conjugated_system_map[i] == sys_id) {
-                com_x += atoms[i].x;
-                com_y += atoms[i].y;
-                com_z += atoms[i].z; // Sum Z coordinates
-                num_atoms_in_system++;
+            
+            // Calculate center of mass for this system
+            double cm_x = 0, cm_y = 0, cm_z = 0;
+            for (int a = 0; a < atom_count; a++) {
+                if (conjugated_system_map[a] == current_system_id) {
+                    cm_x += atoms[a].x;
+                    cm_y += atoms[a].y;
+                    cm_z += atoms[a].z;
+                }
             }
-        }
+            cm_x /= num_atoms_in_system;
+            cm_y /= num_atoms_in_system;
+            cm_z /= num_atoms_in_system;
+            
+            // Make amplitude more system-specific
+            double mo_amplitude = 0.15 * num_atoms_in_system;
+            mo_amplitude *= (1.0 + 0.1 * (current_system_id % 5)); // Vary by system ID
+            
+            // Use more distinctive phase patterns
+            double mo_phase = current_system_id * PI / (current_system_id + 1.0);
+            
+            // Add additional phase modulation based on system properties
+            // For example, count aromatic atoms in the system
+            int aromatic_count = 0;
+            for (int a = 0; a < atom_count; a++) {
+                if (conjugated_system_map[a] == current_system_id && atoms[a].is_aromatic) {
+                    aromatic_count++;
+                }
+            }
+            
+            mo_phase += (aromatic_count * PI) / (8.0 * num_atoms_in_system);
+            
+            // Apply orbital patterns to grid
+            // Scale based on grid dimensions
+            int center_x = (int)(cm_x * (grid_width / 8.0) + grid_width / 2.0);
+            int center_y = (int)(cm_y * (grid_width / 8.0) + grid_width / 2.0);
+            double radius = grid_width / 10.0 * sqrt(num_atoms_in_system);
+            
+            // Apply Z-depth effect to the pattern radius
+            double z_depth_factor = 1.0 / (1.0 + 0.05 * fabs(cm_z));
+            radius *= z_depth_factor;
 
-        if (num_atoms_in_system == 0) continue;
-        com_x /= num_atoms_in_system;
-        com_y /= num_atoms_in_system;
-        com_z /= num_atoms_in_system; // Average Z for the system
+            // Add Z-component to the phase for 3D effect
+            mo_phase += cm_z * 0.05;
 
-        double system_z_depth_effect = focal_length / (focal_length + com_z * 5.0);
-        system_z_depth_effect = clamp_double(system_z_depth_effect, 0.1, 2.0);
-
-        for (int i = 0; i < atom_count; i++) {
-            if (conjugated_system_map[i] == sys_id) {
-                double dx = atoms[i].x - com_x;
-                double dy = atoms[i].y - com_y;
-                // Could also consider dz relative to com_z if needed for extent
-                if (dx*dx + dy*dy > max_extent_sq) {
-                    max_extent_sq = dx*dx + dy*dy;
+            for (int y = 0; y < grid_width; y++) {
+                for (int x = 0; x < grid_width; x++) {
+                    double dx = x - center_x;
+                    double dy = y - center_y;
+                    double dist = sqrt(dx*dx + dy*dy);
+                    
+                    if (dist < radius) {
+                        // Create more distinctive orbital patterns
+                        double pattern_val = sin((dist/radius) * PI * (1 + current_system_id % 3));
+                        pattern_val *= mo_amplitude;
+                        
+                        int idx = y * grid_width + x;
+                        complex double orbital_contrib = pattern_val * cexp(I * mo_phase);
+                        aperture_grid[idx] += orbital_contrib;
+                    }
                 }
             }
         }
-        double system_radius_angstrom = sqrt(max_extent_sq) + 1.0; 
-        double system_radius_px = system_radius_angstrom * (grid_width / 8.0) * system_z_depth_effect; // Apply Z effect to radius
-
-        int center_x_px = (int)(com_x * (grid_width / 8.0) * system_z_depth_effect + grid_width / 2.0); // Apply Z effect to center
-        int center_y_px = (int)(com_y * (grid_width / 8.0) * system_z_depth_effect + grid_width / 2.0);
-        int effect_radius_px = (int)ceil(system_radius_px * 1.2); 
-
-        double mo_phase = sys_id * PI / (current_system_id + 1.0); 
-        double mo_amplitude = 0.1 * num_atoms_in_system; 
-        // Modulate MO amplitude by Z - closer systems appear brighter/stronger
-        mo_amplitude *= system_z_depth_effect;
-
-
-        for (int dy_px = -effect_radius_px; dy_px <= effect_radius_px; dy_px++) {
-            for (int dx_px = -effect_radius_px; dx_px <= effect_radius_px; dx_px++) {
-                int gx = center_x_px + dx_px;
-                int gy = center_y_px + dy_px;
-                if (gx < 0 || gx >= grid_width || gy < 0 || gy >= grid_width) continue;
-
-                double r_px = sqrt(dx_px*dx_px + dy_px*dy_px);
-                if (r_px > system_radius_px * 1.1) continue; 
-
-                double val = mo_amplitude * exp(-(r_px*r_px) / (2.0 * system_radius_px * system_radius_px * 0.5));
-                
-                // Add a slight phase shift based on the system's average Z for depth feel
-                complex double system_z_phase_mod = cexp(I * com_z * 0.03);
-
-                aperture_grid[gy * grid_width + gx] += val * cexp(I * mo_phase) * system_z_phase_mod;
-            }
-        }
     }
+    
     free(conjugated_system_map);
 }
 
@@ -731,4 +870,411 @@ void optimize_molecule_layout_batch(
         atom_count = original_global_atom_count;
         bond_count = original_global_bond_count;
     }
+}
+
+// Enhanced molecular orbital and quantum effects for creating more distinctive diffraction patterns
+void enhance_diffraction_with_electronic_effects(complex double *aperture_grid, int grid_width, 
+                                                AtomPos *atoms, int atom_count, 
+                                                BondSeg *bonds, int bond_count) {
+    if (atom_count == 0 || !aperture_grid) return;
+    
+    // Local grid for electronic effects
+    complex double *electronic_grid = calloc(grid_width * grid_width, sizeof(complex double));
+    if (!electronic_grid) {
+        fprintf(stderr, "Error: Memory allocation failed for electronic effects grid.\n");
+        return;
+    }
+    
+    // 1. Process conjugated systems with enhanced wave patterns
+    // First identify conjugated systems
+    int *conjugated_systems = calloc(atom_count, sizeof(int));
+    if (!conjugated_systems) {
+        free(electronic_grid);
+        fprintf(stderr, "Error: Memory allocation failed for conjugated system mapping.\n");
+        return;
+    }
+    
+    // Find and identify conjugated systems
+    int system_count = 0;
+    for (int i = 0; i < atom_count; i++) {
+        if ((atoms[i].is_aromatic || 
+            (atoms[i].hybridization > 1.5 && atoms[i].hybridization < 2.5)) && 
+            conjugated_systems[i] == 0) {
+            
+            system_count++;
+            
+            // Find connected atoms in the conjugated system through BFS
+            int *queue = calloc(atom_count, sizeof(int));
+            if (!queue) {
+                free(electronic_grid);
+                free(conjugated_systems);
+                fprintf(stderr, "Error: Queue allocation failed.\n");
+                return;
+            }
+            
+            int front = 0, rear = 0;
+            queue[rear++] = i;
+            conjugated_systems[i] = system_count;
+            
+            int system_atoms = 1;
+            double cm_x = 0, cm_y = 0, cm_z = 0;
+            
+            // BFS to find connected conjugated atoms
+            while (front < rear) {
+                int curr = queue[front++];
+                
+                // Add to center of mass calculation
+                cm_x += atoms[curr].x;
+                cm_y += atoms[curr].y;
+                cm_z += atoms[curr].z;
+                
+                // Find connected atoms through bonds
+                for (int b = 0; b < bond_count; b++) {
+                    int next_atom = -1;
+                    if (bonds[b].a == curr) next_atom = bonds[b].b;
+                    else if (bonds[b].b == curr) next_atom = bonds[b].a;
+                    
+                    if (next_atom != -1 && conjugated_systems[next_atom] == 0 &&
+                        (atoms[next_atom].is_aromatic || 
+                        (atoms[next_atom].hybridization > 1.5 && atoms[next_atom].hybridization < 2.5) ||
+                        bonds[b].type == BOND_AROMATIC || bonds[b].is_conjugated)) {
+                        
+                        conjugated_systems[next_atom] = system_count;
+                        queue[rear++] = next_atom;
+                        system_atoms++;
+                    }
+                }
+            }
+            
+            free(queue);
+            
+            if (system_atoms > 1) {
+                // Calculate center of mass
+                cm_x /= system_atoms;
+                cm_y /= system_atoms;
+                cm_z /= system_atoms;
+                
+                // Calculate the spatial extent of the system
+                double max_dist = 0;
+                for (int a = 0; a < atom_count; a++) {
+                    if (conjugated_systems[a] == system_count) {
+                        double dx = atoms[a].x - cm_x;
+                        double dy = atoms[a].y - cm_y;
+                        double dz = atoms[a].z - cm_z;
+                        double dist = sqrt(dx*dx + dy*dy + dz*dz);
+                        if (dist > max_dist) max_dist = dist;
+                    }
+                }
+                
+                // Create a distinctive orbital pattern for this conjugated system
+                double scale_factor = grid_width / 8.0;
+                int center_x = (int)(cm_x * scale_factor + grid_width / 2.0);
+                int center_y = (int)(cm_y * scale_factor + grid_width / 2.0);
+                double z_depth_factor = 1.0 / (1.0 + 0.1 * fabs(cm_z)); // Z-dependent scaling
+                
+                // Radius is proportional to system size, adjusted by z-depth
+                double radius = (grid_width / 10.0) * sqrt(system_atoms) * z_depth_factor;
+                
+                // Generate a unique phase pattern for this conjugated system
+                double base_phase = system_count * PI / 5.0; // Different phase per system
+                
+                // Distinctive amplitude based on system characteristics
+                double amplitude = 0.2 * system_atoms;
+                
+                // Make systems with more aromatic character stronger
+                int aromatic_count = 0;
+                for (int a = 0; a < atom_count; a++) {
+                    if (conjugated_systems[a] == system_count && atoms[a].is_aromatic) {
+                        aromatic_count++;
+                    }
+                }
+                double aromatic_factor = (double)aromatic_count / system_atoms;
+                amplitude *= (1.0 + 0.5 * aromatic_factor);
+                
+                // Add distinctive nodal patterns based on system size and type
+                int nodal_pattern = 2 + (system_atoms % 3); // Different node count
+                
+                // Apply the orbital pattern to grid points
+                for (int y = 0; y < grid_width; y++) {
+                    for (int x = 0; x < grid_width; x++) {
+                        double dx = x - center_x;
+                        double dy = y - center_y;
+                        double dist = sqrt(dx*dx + dy*dy);
+                        
+                        if (dist < radius * 1.5) { // Extend beyond the core radius
+                            // Nodal pattern based on system size
+                            double pattern_val = 0.0;
+                            double normalized_dist = dist / radius;
+                            
+                            // Radial part - creates nodal rings
+                            double radial = sin(normalized_dist * PI * nodal_pattern) * exp(-normalized_dist);
+                            
+                            // Angular part - creates angular nodes
+                            double theta = atan2(dy, dx);
+                            int angular_nodes = 1 + (system_count % 5); // Different angular patterns
+                            double angular = cos(angular_nodes * theta);
+                            
+                            // Combine radial and angular patterns
+                            pattern_val = radial * angular * amplitude;
+                            
+                            // Attenuate by distance
+                            double attenuation = exp(-normalized_dist * 0.5);
+                            pattern_val *= attenuation;
+                            
+                            // Calculate phase - modulated by system-specific factors
+                            double phase = base_phase + normalized_dist * 0.3 * PI;
+                            
+                            if (aromatic_factor > 0.5) {
+                                // More complex phase patterns for highly aromatic systems
+                                phase += cos(theta * angular_nodes) * 0.2 * PI;
+                            }
+                            
+                            // Modulate by Z-position for 3D effect
+                            phase += cm_z * 0.1;
+                            
+                            int idx = y * grid_width + x;
+                            complex double contribution = pattern_val * cexp(I * phase);
+                            electronic_grid[idx] += contribution;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // 2. Add individual atomic orbital patterns (for non-conjugated atoms)
+    for (int i = 0; i < atom_count; i++) {
+        if (conjugated_systems[i] == 0) { // Skip atoms in conjugated systems
+            double scale_factor = grid_width / 8.0;
+            
+            // Perspective projection
+            double z_depth_effect = 1.0 / (1.0 + 0.1 * fabs(atoms[i].z));
+            scale_factor *= z_depth_effect;
+            
+            int center_x = (int)(atoms[i].x * scale_factor + grid_width / 2.0);
+            int center_y = (int)(atoms[i].y * scale_factor + grid_width / 2.0);
+            
+            // Set radius based on atomic properties
+            double atom_radius = atoms[i].radius * 3.0 * scale_factor;
+            if (atom_radius < 1.0) atom_radius = 1.0;
+            
+            // Set amplitude based on electronic properties
+            double amplitude = 0.15;
+            
+            // Add electronegative atom effects
+            if (atoms[i].electronegativity > 2.5) {
+                amplitude *= (1.0 + 0.2 * (atoms[i].electronegativity - 2.5));
+            }
+            
+            // Add effects for atoms with lone pairs or partial charges
+            if (atoms[i].partial_charge != 0) {
+                amplitude *= (1.0 + 0.3 * fabs(atoms[i].partial_charge));
+            }
+            
+            // Generate phase based on atomic properties
+            double phase = atoms[i].atomic_number * PI / 15.0;
+            
+            // Add hybridization effects
+            phase += atoms[i].hybridization * PI / 10.0;
+            
+            // Add positional modulation
+            phase += (atoms[i].x + atoms[i].y + atoms[i].z) * 0.1;
+            
+            // Apply atomic orbital pattern
+            for (int y = 0; y < grid_width; y++) {
+                for (int x = 0; x < grid_width; x++) {
+                    double dx = x - center_x;
+                    double dy = y - center_y;
+                    double dist_sq = dx*dx + dy*dy;
+                    double dist = sqrt(dist_sq);
+                    
+                    if (dist < atom_radius * 2.0) {
+                        double normalized_dist = dist / atom_radius;
+                        double orbital_val = 0.0;
+                        
+                        // Shape based on hybridization
+                        if (atoms[i].hybridization > 2.5) { // sp3
+                            // Spherical-like pattern
+                            orbital_val = exp(-normalized_dist * normalized_dist) * amplitude;
+                        } else if (atoms[i].hybridization > 1.5) { // sp2
+                            // Planar pattern
+                            double theta = atan2(dy, dx);
+                            orbital_val = exp(-normalized_dist * normalized_dist) * 
+                                        (1.0 + 0.3 * cos(3 * theta)) * amplitude;
+                        } else { // sp or s
+                            // Linear or spherical pattern
+                            orbital_val = exp(-normalized_dist * normalized_dist) * amplitude;
+                        }
+                        
+                        // Apply Z-position phase modulation
+                        double z_phase = atoms[i].z * 0.1;
+                        
+                        int idx = y * grid_width + x;
+                        complex double contribution = orbital_val * cexp(I * (phase + z_phase));
+                        electronic_grid[idx] += contribution;
+                    }
+                }
+            }
+        }
+    }
+    
+    // 3. Add bond effects, especially for key bonds like hydrogen bonds
+    for (int i = 0; i < bond_count; i++) {
+        int a1 = bonds[i].a;
+        int a2 = bonds[i].b;
+        
+        // Skip bonds within the same conjugated system
+        if (conjugated_systems[a1] != 0 && conjugated_systems[a1] == conjugated_systems[a2]) {
+            continue;
+        }
+        
+        // Process important non-conjugated bonds
+        double scale_factor = grid_width / 8.0;
+        
+        // Get atom coordinates and adjust by Z-depth
+        double x1 = atoms[a1].x;
+        double y1 = atoms[a1].y;
+        double z1 = atoms[a1].z;
+        double x2 = atoms[a2].x;
+        double y2 = atoms[a2].y;
+        double z2 = atoms[a2].z;
+        
+        // Calculate midpoint and adjust for perspective
+        double mid_x = (x1 + x2) / 2.0;
+        double mid_y = (y1 + y2) / 2.0;
+        double mid_z = (z1 + z2) / 2.0;
+        
+        double z_depth_effect = 1.0 / (1.0 + 0.1 * fabs(mid_z));
+        scale_factor *= z_depth_effect;
+        
+        int center_x = (int)(mid_x * scale_factor + grid_width / 2.0);
+        int center_y = (int)(mid_y * scale_factor + grid_width / 2.0);
+        
+        // Calculate bond vector
+        double dx_bond = x2 - x1;
+        double dy_bond = y2 - y1;
+        double bond_length = sqrt(dx_bond*dx_bond + dy_bond*dy_bond);
+        if (bond_length < 0.001) bond_length = 0.001;
+        
+        // Normalize bond vector
+        double nx_bond = dx_bond / bond_length;
+        double ny_bond = dy_bond / bond_length;
+        
+        // Amplitude based on bond type
+        double amplitude = 0.1;
+        if (bonds[i].order > 1) {
+            amplitude += 0.05 * bonds[i].order;
+        }
+        
+        // Special effects for important bond types
+        if (bonds[i].type == BOND_HYDROGEN || 
+            bonds[i].type == BOND_IONIC || 
+            bonds[i].type == BOND_DATIVE) {
+            amplitude *= 1.5;
+        }
+        
+        // Bond-specific phase
+        double bond_phase = bonds[i].order * PI / 4.0;
+        
+        // Add electronegativity difference effect
+        double en_diff = fabs(atoms[a1].electronegativity - atoms[a2].electronegativity);
+        bond_phase += en_diff * PI / 10.0;
+        
+        // Add 3D effect from Z-coordinate
+        bond_phase += mid_z * 0.1;
+        
+        // Bond radius scaled by bond order and Z-depth
+        double bond_radius = bonds[i].order * 2.0 * scale_factor;
+        if (bond_radius < 1.0) bond_radius = 1.0;
+        
+        // Apply bond pattern
+        for (int y = 0; y < grid_width; y++) {
+            for (int x = 0; x < grid_width; x++) {
+                double dx = x - center_x;
+                double dy = y - center_y;
+                
+                // Project point onto bond axis to determine position along bond
+                double proj = dx * nx_bond + dy * ny_bond;
+                
+                // Calculate perpendicular distance from bond axis
+                double perp_dx = dx - proj * nx_bond;
+                double perp_dy = dy - proj * ny_bond;
+                double perp_dist = sqrt(perp_dx*perp_dx + perp_dy*perp_dy);
+                
+                // Bond pattern is stronger along axis and drops off perpendicular to it
+                if (perp_dist < bond_radius && fabs(proj) < bond_length * scale_factor / 2.0) {
+                    // Calculate position along bond (0 to 1)
+                    double pos = (proj / scale_factor + bond_length / 2.0) / bond_length;
+                    pos = fmax(0.0, fmin(1.0, pos));
+                    
+                    // Create bond-specific pattern
+                    double pattern_val = 0.0;
+                    
+                    // Basic bond pattern decreases with perpendicular distance
+                    pattern_val = exp(-perp_dist * perp_dist / (bond_radius * bond_radius)) * amplitude;
+                    
+                    // Multiple bond patterns have nodes
+                    if (bonds[i].order == 2) {
+                        pattern_val *= (1.0 + 0.3 * sin(pos * 2.0 * PI));
+                    } else if (bonds[i].order == 3) {
+                        pattern_val *= (1.0 + 0.3 * sin(pos * 3.0 * PI));
+                    }
+                    
+                    // Polar bonds have asymmetric patterns
+                    if (en_diff > 0.5) {
+                        pattern_val *= (1.0 + 0.2 * (pos - 0.5) * en_diff);
+                    }
+                    
+                    // Add Z-modulation for 3D effect
+                    double z_pos = z1 * (1.0 - pos) + z2 * pos;
+                    double z_phase_mod = z_pos * 0.05;
+                    
+                    int idx = y * grid_width + x;
+                    complex double contribution = pattern_val * cexp(I * (bond_phase + z_phase_mod));
+                    electronic_grid[idx] += contribution;
+                }
+            }
+        }
+    }
+    
+    // 4. Combine electronic grid with the main aperture grid
+    for (int i = 0; i < grid_width * grid_width; i++) {
+        aperture_grid[i] += electronic_grid[i] * 0.7; // Scale factor to control strength
+    }
+    
+    // Clean up
+    free(electronic_grid);
+    free(conjugated_systems);
+}
+
+// Calculate molecular form factor - used for improved diffraction patterns
+complex double calculate_molecular_form_factor(AtomPos atom, double q_magnitude) {
+    // Form factor approximation based on atomic properties
+    // q_magnitude is the scattering vector magnitude
+    
+    // Base scattering factor depends on electron count (atomic number)
+    double base_factor = atom.atomic_number;
+    
+    // Approximate scattering falloff with q using exponential form
+    // f(q) = sum(a_i * exp(-b_i * q^2))
+    // Simplified to a single gaussian term for each atom
+    double b_factor = pow(atom.radius, 2.0) * 0.5;
+    double amplitude = base_factor * exp(-b_factor * q_magnitude * q_magnitude);
+    
+    // Calculate phase shift based on atomic properties
+    double phase = 0.0;
+    
+    // Phase contribution from electronic structure
+    phase += atom.electronegativity * 0.1;
+    
+    // Phase contribution from hybridization
+    phase += atom.hybridization * 0.05;
+    
+    // Phase from partial charge
+    phase += atom.partial_charge * 0.3;
+    
+    // Apply phase modulation
+    complex double form_factor = amplitude * cexp(I * phase);
+    
+    return form_factor;
 }

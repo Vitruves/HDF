@@ -23,7 +23,7 @@ CFLAGS = $(BASE_CFLAGS)
 LDFLAGS = $(BASE_LDFLAGS)
 
 # CUDA flags
-CUDAFLAGS = -O3 -arch=sm_60 -Xcompiler -fPIC
+CUDAFLAGS = -O3 -arch=sm_60 -Xcompiler -fPIC -Wno-deprecated-gpu-targets
 
 # Detect OS
 UNAME_S := $(shell uname -s)

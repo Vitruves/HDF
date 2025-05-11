@@ -57,6 +57,11 @@ typedef struct {
     int csv_buffer_size;
     bool column_format;
     int condense_block_size;
+
+    // Feature image generation
+    bool generate_feature_image;   // Flag to generate feature image
+    int feature_image_channels;    // Number of channels for feature image
+    bool orient_molecules;         // Orient molecules based on principal axes
 } CliArgs;
 
 // Global variables for CUDA control

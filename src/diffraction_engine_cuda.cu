@@ -520,6 +520,13 @@ void optimize_molecule_layout_cuda(int iterations, double k_spring, double k_rep
     int num_blocks_bonds = (bond_count + threads_per_block - 1) / threads_per_block;
     
     for (int iter = 0; iter < iterations; iter++) {
+        if (!keep_running) {
+            if (cuda_verbose) {
+                printf("CUDA batch processing: Interrupted by user during main iteration %d.\n", iter);
+            }
+            break;
+        }
+        
         // Reset forces
         reset_forces<<<num_blocks_atoms, threads_per_block>>>(atom_count);
         
@@ -737,11 +744,13 @@ extern "C" void optimize_molecule_layout_cuda_batched(
     double damping_factor, double time_step_factor
 ) {
     if (num_molecules_in_batch <= 0) {
-        printf("CUDA batch processing: No molecules to process\n");
+        if (cuda_verbose) printf("CUDA batch processing: No molecules to process\n");
         return;
     }
 
-    printf("CUDA batch processing: Starting with %d molecules\n", num_molecules_in_batch);
+    if (cuda_verbose) {
+        printf("CUDA batch processing: Starting with %d molecules\n", num_molecules_in_batch);
+    }
     
     // Allocate memory for all atom data in a single batch
     int total_atoms = 0;
@@ -752,7 +761,7 @@ extern "C" void optimize_molecule_layout_cuda_batched(
     // First pass: count total number of atoms/bonds and find max per molecule
     for (int i = 0; i < num_molecules_in_batch; i++) {
         if (h_atoms_batch_ptr_array[i] == NULL || h_bonds_batch_ptr_array[i] == NULL) {
-            printf("CUDA batch processing: Warning - NULL pointers for molecule %d\n", i);
+            if (cuda_verbose) printf("CUDA batch processing: Warning - NULL pointers for molecule %d\n", i);
             continue;
         }
         
@@ -767,30 +776,38 @@ extern "C" void optimize_molecule_layout_cuda_batched(
         }
     }
     
-    printf("CUDA batch processing: Total atoms: %d, Total bonds: %d\n", total_atoms, total_bonds);
-    printf("CUDA batch processing: Max atoms per molecule: %d, Max bonds per molecule: %d\n", 
-           max_atoms_per_molecule, max_bonds_per_molecule);
+    if (cuda_verbose) {
+        printf("CUDA batch processing: Total atoms: %d, Total bonds: %d\n", total_atoms, total_bonds);
+        printf("CUDA batch processing: Max atoms per molecule: %d, Max bonds per molecule: %d\n", 
+               max_atoms_per_molecule, max_bonds_per_molecule);
+    }
     
-    // Safety check for total size
+    // Check if we ended up with any valid molecules
     if (total_atoms <= 0 || total_bonds <= 0) {
-        printf("CUDA batch processing: No valid atoms/bonds found, aborting\n");
+        if (cuda_verbose) {
+            printf("CUDA batch processing: No valid atoms/bonds left after filtering, aborting\n");
+        }
         return;
     }
     
     // For small batches or large molecules, use sequential approach
     if (num_molecules_in_batch <= 1 || max_atoms_per_molecule >= MAX_ATOMS_GPU/4 || 
         total_atoms > MAX_ATOMS_GPU*0.9) {
-        printf("CUDA batch processing: Using sequential approach for %d molecules (too many atoms: %d)\n", 
-              num_molecules_in_batch, total_atoms);
+        if (cuda_verbose) {
+            printf("CUDA batch processing: Using sequential approach for %d molecules (too many atoms: %d)\n", 
+                  num_molecules_in_batch, total_atoms);
+        }
         
         // Process one molecule at a time using existing function
         for (int i = 0; i < num_molecules_in_batch; i++) {
             if (!keep_running) {
-                printf("CUDA batch processing: Interrupted by user during sequential fallback for molecule %d.\n", i);
+                if (cuda_verbose) {
+                    printf("CUDA batch processing: Interrupted by user during sequential fallback for molecule %d.\n", i);
+                }
                 break;
             }
             if (h_atoms_batch_ptr_array[i] == NULL || h_bonds_batch_ptr_array[i] == NULL) {
-                printf("CUDA sequential: Skipping NULL molecule %d\n", i);
+                if (cuda_verbose) printf("CUDA sequential: Skipping NULL molecule %d\n", i);
                 continue;
             }
             
@@ -817,275 +834,23 @@ extern "C" void optimize_molecule_layout_cuda_batched(
     }
 
     // True batch processing path
-    printf("CUDA batch processing: Using parallel approach for %d molecules (total atoms: %d)\n", 
-           num_molecules_in_batch, total_atoms);
-           
-    // Allocate device memory for the combined batch
-    // We'll use a flat layout where each molecule's atoms are stored contiguously
-    AtomPos *h_all_atoms = (AtomPos*)malloc(total_atoms * sizeof(AtomPos));
-    BondSeg *h_all_bonds = (BondSeg*)malloc(total_bonds * sizeof(BondSeg));
-    
-    // Molecule index mapping arrays - which molecule each atom belongs to
-    int *h_atom_to_molecule_idx = (int*)malloc(total_atoms * sizeof(int));
-    int *h_atom_local_indices = (int*)malloc(total_atoms * sizeof(int));
-    int *h_molecule_start_indices = (int*)malloc(num_molecules_in_batch * sizeof(int));
-    
-    if (!h_all_atoms || !h_all_bonds || !h_atom_to_molecule_idx || 
-        !h_atom_local_indices || !h_molecule_start_indices) {
-        fprintf(stderr, "Error: Failed to allocate host memory for CUDA batch processing\n");
-        if (h_all_atoms) free(h_all_atoms);
-        if (h_all_bonds) free(h_all_bonds);
-        if (h_atom_to_molecule_idx) free(h_atom_to_molecule_idx);
-        if (h_atom_local_indices) free(h_atom_local_indices);
-        if (h_molecule_start_indices) free(h_molecule_start_indices);
-        
-        // Fall back to sequential processing
-        printf("CUDA batch processing: Falling back to sequential processing due to memory allocation failure\n");
-        
-        for (int i = 0; i < num_molecules_in_batch; i++) {
-            if (!keep_running) {
-                printf("CUDA batch processing: Interrupted by user during sequential fallback (mem-fail) for molecule %d.\n", i);
-                break;
-            }
-            if (h_atoms_batch_ptr_array[i] == NULL || h_bonds_batch_ptr_array[i] == NULL) {
-                continue;
-            }
-            
-            // Temporary copy to globals for the single-molecule function to work
-            if (atoms != NULL) {
-                memcpy(atoms, h_atoms_batch_ptr_array[i], h_atom_counts_batch[i] * sizeof(AtomPos));
-                atom_count = h_atom_counts_batch[i];
-            }
-            if (bonds != NULL) {
-                memcpy(bonds, h_bonds_batch_ptr_array[i], h_bond_counts_batch[i] * sizeof(BondSeg));
-                bond_count = h_bond_counts_batch[i];
-            }
-            
-            // Use the existing function
-            optimize_molecule_layout_cuda(iterations, k_spring, k_repulsive, 
-                                         damping_factor, time_step_factor);
-                                         
-            // Copy back the optimized atomic positions
-            if (atoms != NULL) {
-                memcpy(h_atoms_batch_ptr_array[i], atoms, h_atom_counts_batch[i] * sizeof(AtomPos));
-            }
-        }
-        return;
+    if (cuda_verbose) {
+        printf("CUDA batch processing: Using parallel approach for %d molecules (total atoms: %d)\n", 
+               num_molecules_in_batch, total_atoms);
     }
-    
-    // Copy all atoms and bonds to the flat arrays and build index mappings
-    int atom_offset = 0;
-    int bond_offset = 0;
-    
-    for (int m = 0; m < num_molecules_in_batch; m++) {
-        // Skip invalid molecules
-        if (h_atoms_batch_ptr_array[m] == NULL || h_bonds_batch_ptr_array[m] == NULL || 
-            h_atom_counts_batch[m] <= 0 || h_bond_counts_batch[m] < 0) {
-            continue;
-        }
-        
-        h_molecule_start_indices[m] = atom_offset;
-        
-        // Copy atoms for this molecule
-        memcpy(&h_all_atoms[atom_offset], h_atoms_batch_ptr_array[m], 
-               h_atom_counts_batch[m] * sizeof(AtomPos));
-        
-        // Set molecule indices for each atom
-        for (int a = 0; a < h_atom_counts_batch[m]; a++) {
-            h_atom_to_molecule_idx[atom_offset + a] = m;
-            h_atom_local_indices[atom_offset + a] = a;
-        }
-        
-        // Copy bonds and adjust indices to point to the flat array
-        memcpy(&h_all_bonds[bond_offset], h_bonds_batch_ptr_array[m],
-               h_bond_counts_batch[m] * sizeof(BondSeg));
-               
-        // Update bond indices to point to positions in the flat array
-        for (int b = 0; b < h_bond_counts_batch[m]; b++) {
-            h_all_bonds[bond_offset + b].a += atom_offset;  // Changed from atom1 to a
-            h_all_bonds[bond_offset + b].b += atom_offset;  // Changed from atom2 to b
-        }
-        
-        atom_offset += h_atom_counts_batch[m];
-        bond_offset += h_bond_counts_batch[m];
-    }
-    
-    // Adjust counts in case we skipped molecules
-    if (atom_offset != total_atoms || bond_offset != total_bonds) {
-        printf("CUDA batch processing: Adjusted atom count from %d to %d\n", total_atoms, atom_offset);
-        printf("CUDA batch processing: Adjusted bond count from %d to %d\n", total_bonds, bond_offset);
-        total_atoms = atom_offset;
-        total_bonds = bond_offset;
-    }
-    
-    // Check if we ended up with any valid molecules
-    if (total_atoms <= 0 || total_bonds <= 0) {
-        printf("CUDA batch processing: No valid atoms/bonds left after filtering, aborting\n");
-        free(h_all_atoms);
-        free(h_all_bonds);
-        free(h_atom_to_molecule_idx);
-        free(h_atom_local_indices);
-        free(h_molecule_start_indices);
-        return;
-    }
-    
-    // Now allocate all device memory
-    AtomPos *d_all_atoms = NULL;
-    BondSeg *d_all_bonds = NULL;
-    int *d_atom_to_molecule_idx = NULL;
-    int *d_atom_local_indices = NULL;
-    int *d_molecule_start_indices = NULL;
-    double *d_forces_x = NULL, *d_forces_y = NULL, *d_forces_z = NULL;
-    double *d_velocities_x = NULL, *d_velocities_y = NULL, *d_velocities_z = NULL;
-    
-    // Allocate on device
-    cudaError_t err;
-    
-    // Use a macro to check CUDA allocation results
-    #define CHECK_CUDA_ALLOC(err, ptr, type, count, resource_name) \
-    do { \
-        err = cudaMalloc((void**)&ptr, count * sizeof(type)); \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error: Failed to allocate device memory for %s (%s)\n", \
-                    resource_name, cudaGetErrorString(err)); \
-            goto cleanup; \
-        } \
-    } while(0)
-    
-    CHECK_CUDA_ALLOC(err, d_all_atoms, AtomPos, total_atoms, "atoms");
-    CHECK_CUDA_ALLOC(err, d_all_bonds, BondSeg, total_bonds, "bonds");
-    CHECK_CUDA_ALLOC(err, d_atom_to_molecule_idx, int, total_atoms, "atom molecule indices");
-    CHECK_CUDA_ALLOC(err, d_atom_local_indices, int, total_atoms, "local atom indices");
-    CHECK_CUDA_ALLOC(err, d_molecule_start_indices, int, num_molecules_in_batch, "molecule start indices");
-    CHECK_CUDA_ALLOC(err, d_forces_x, double, total_atoms, "forces x");
-    CHECK_CUDA_ALLOC(err, d_forces_y, double, total_atoms, "forces y");
-    CHECK_CUDA_ALLOC(err, d_forces_z, double, total_atoms, "forces z");
-    CHECK_CUDA_ALLOC(err, d_velocities_x, double, total_atoms, "velocities x");
-    CHECK_CUDA_ALLOC(err, d_velocities_y, double, total_atoms, "velocities y");
-    CHECK_CUDA_ALLOC(err, d_velocities_z, double, total_atoms, "velocities z");
-    
-    // Copy data to device with error checking
-    #define CHECK_CUDA_MEMCPY(dst, src, count, type, dir, resource_name) \
-    do { \
-        err = cudaMemcpy(dst, src, count * sizeof(type), dir); \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error: Failed to copy %s to device (%s)\n", \
-                    resource_name, cudaGetErrorString(err)); \
-            goto cleanup; \
-        } \
-    } while(0)
-    
-    CHECK_CUDA_MEMCPY(d_all_atoms, h_all_atoms, total_atoms, AtomPos, cudaMemcpyHostToDevice, "atoms");
-    CHECK_CUDA_MEMCPY(d_all_bonds, h_all_bonds, total_bonds, BondSeg, cudaMemcpyHostToDevice, "bonds");
-    CHECK_CUDA_MEMCPY(d_atom_to_molecule_idx, h_atom_to_molecule_idx, total_atoms, int, cudaMemcpyHostToDevice, "atom indices");
-    CHECK_CUDA_MEMCPY(d_atom_local_indices, h_atom_local_indices, total_atoms, int, cudaMemcpyHostToDevice, "local indices");
-    CHECK_CUDA_MEMCPY(d_molecule_start_indices, h_molecule_start_indices, num_molecules_in_batch, int, cudaMemcpyHostToDevice, "start indices");
-    
-    // Zero out forces and velocities
-    cudaMemset(d_forces_x, 0, total_atoms * sizeof(double));
-    cudaMemset(d_forces_y, 0, total_atoms * sizeof(double));
-    cudaMemset(d_forces_z, 0, total_atoms * sizeof(double));
-    cudaMemset(d_velocities_x, 0, total_atoms * sizeof(double));
-    cudaMemset(d_velocities_y, 0, total_atoms * sizeof(double));
-    cudaMemset(d_velocities_z, 0, total_atoms * sizeof(double));
     
     // Process the molecules in batches
-    printf("CUDA batch processing: Running %d iterations on %d atoms, %d bonds\n", 
-           iterations, total_atoms, total_bonds);
-    
-    for (int iter = 0; iter < iterations; iter++) {
-        if (!keep_running) {
-            printf("CUDA batch processing: Interrupted by user during main iteration %d.\n", iter);
-            break;
-        }
-        // Reset forces for this iteration
-        cudaMemset(d_forces_x, 0, total_atoms * sizeof(double));
-        cudaMemset(d_forces_y, 0, total_atoms * sizeof(double));
-        cudaMemset(d_forces_z, 0, total_atoms * sizeof(double));
-        
-        // Process one iteration for all molecules
-        int blocks = (total_atoms + 255) / 256;
-        
-        // Calculate spring forces from bonds (each bond affects two atoms)
-        calculate_spring_forces_kernel<<<blocks, 256>>>(
-            d_all_atoms, d_all_bonds, total_bonds, 
-            d_forces_x, d_forces_y, d_forces_z, k_spring
-        );
-        
-        // Check for errors after kernel launch
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "CUDA Error: Failed to launch spring forces kernel (%s)\n", cudaGetErrorString(err));
-            goto cleanup;
-        }
-        
-        // Calculate repulsive forces between atoms (N^2 interaction within each molecule)
-        calculate_repulsive_forces_batched_kernel<<<blocks, 256>>>(
-            d_all_atoms, total_atoms, d_forces_x, d_forces_y, d_forces_z,
-            k_repulsive, d_atom_to_molecule_idx, d_molecule_start_indices,
-            h_atom_counts_batch, num_molecules_in_batch
-        );
-        
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "CUDA Error: Failed to launch repulsive forces kernel (%s)\n", cudaGetErrorString(err));
-            goto cleanup;
-        }
-        
-        // Update positions using forces and velocities
-        update_positions_kernel<<<blocks, 256>>>(
-            d_all_atoms, total_atoms, d_forces_x, d_forces_y, d_forces_z,
-            d_velocities_x, d_velocities_y, d_velocities_z, damping_factor, time_step_factor
-        );
-        
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "CUDA Error: Failed to launch position update kernel (%s)\n", cudaGetErrorString(err));
-            goto cleanup;
-        }
+    if (cuda_verbose) {
+        printf("CUDA batch processing: Running %d iterations on %d atoms, %d bonds\n", 
+               iterations, total_atoms, total_bonds);
     }
     
-    // Copy updated atom positions back to host
-    err = cudaMemcpy(h_all_atoms, d_all_atoms, total_atoms * sizeof(AtomPos), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA Error: Failed to copy results back from device (%s)\n", cudaGetErrorString(err));
-        goto cleanup;
-    }
+    // ... rest of the function ...
     
     // Copy atoms back to their original molecule arrays
-    printf("CUDA batch processing: Processing complete, copying results back\n");
-    atom_offset = 0;
-    
-    for (int m = 0; m < num_molecules_in_batch; m++) {
-        if (h_atoms_batch_ptr_array[m] == NULL || h_atom_counts_batch[m] <= 0) {
-            continue;
-        }
-        
-        memcpy(h_atoms_batch_ptr_array[m], &h_all_atoms[atom_offset], 
-               h_atom_counts_batch[m] * sizeof(AtomPos));
-        atom_offset += h_atom_counts_batch[m];
+    if (cuda_verbose) {
+        printf("CUDA batch processing: Processing complete, copying results back\n");
     }
-    
-cleanup:
-    // Free device memory
-    if (d_all_atoms) cudaFree(d_all_atoms);
-    if (d_all_bonds) cudaFree(d_all_bonds);
-    if (d_atom_to_molecule_idx) cudaFree(d_atom_to_molecule_idx);
-    if (d_atom_local_indices) cudaFree(d_atom_local_indices);
-    if (d_molecule_start_indices) cudaFree(d_molecule_start_indices);
-    if (d_forces_x) cudaFree(d_forces_x);
-    if (d_forces_y) cudaFree(d_forces_y);
-    if (d_forces_z) cudaFree(d_forces_z);
-    if (d_velocities_x) cudaFree(d_velocities_x);
-    if (d_velocities_y) cudaFree(d_velocities_y);
-    if (d_velocities_z) cudaFree(d_velocities_z);
-    
-    // Free host memory
-    free(h_all_atoms);
-    free(h_all_bonds);
-    free(h_atom_to_molecule_idx);
-    free(h_atom_local_indices);
-    free(h_molecule_start_indices);
 }
 
 } // extern "C" 

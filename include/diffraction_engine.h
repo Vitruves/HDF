@@ -3,6 +3,7 @@
 
 #include <complex.h>
 #include "molecule.h"
+#include <stdbool.h>
 
 // Function declarations
 void optimize_molecule_layout(int iterations, double k_spring, double k_repulsive, 
@@ -24,10 +25,14 @@ void optimize_molecule_layout_batch(
     int iterations, double k_spring, double k_repulsive,
     double damping_factor, double time_step_factor
 );
+void enhance_diffraction_with_electronic_effects(complex double *aperture_grid, int grid_width, 
+                                              AtomPos *atoms, int atom_count, 
+                                              BondSeg *bonds, int bond_count);
 
 // QM model calculation functions (will be defined in quantum_engine.c)
 double calculate_atom_phase_qm(AtomPos atom, int idx);
 double calculate_bond_phase_qm(BondSeg bond);
 double electron_density(AtomPos atom, double rel_x, double rel_y, double rel_z);
+complex double calculate_molecular_form_factor(AtomPos atom, double q_magnitude);
 
 #endif /* DIFFRACTION_ENGINE_H */
